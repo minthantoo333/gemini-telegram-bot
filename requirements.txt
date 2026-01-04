@@ -1,0 +1,6 @@
+python-telegram-bot
+google-genai
+faster-whisper
+pysrt
+yt-dlp
+torch
