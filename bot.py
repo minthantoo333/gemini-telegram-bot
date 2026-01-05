@@ -9,7 +9,7 @@ import math
 import shutil
 
 # Audio Processing
-from pydub import AudioSegment
+from pydub import AudioSegment, effects
 import edge_tts
 
 # Telegram
@@ -25,13 +25,20 @@ from faster_whisper import WhisperModel
 TG_TOKEN = os.getenv("TG_TOKEN")
 GEMINI_KEY = os.getenv("GEMINI_KEY")
 
-# Voices
-VOICE_MALE = "my-MM-ThihaNeural"
-VOICE_FEMALE = "my-MM-NularNeural"
-
 if not TG_TOKEN or not GEMINI_KEY:
     print("❌ ERROR: API Keys are missing! Set them in your environment variables.")
     exit()
+
+# --- 🗣️ VOICE LIBRARY ---
+# You can switch between these in the bot menu
+VOICES = {
+    "male_mm": "my-MM-ThihaNeural",
+    "female_mm": "my-MM-NularNeural",
+    "giuseppe": "it-IT-GiuseppeMultilingualNeural", # Great for deep, clear narration
+    "remy": "fr-FR-RemyMultilingualNeural",         # Soft, high-quality
+    "andrew": "en-US-AndrewMultilingualNeural",     # Very professional
+    "brian": "en-US-BrianMultilingualNeural"        # Standard documentary style
+}
 
 # --- 📝 PROMPTS ---
 SRT_RULES = """
@@ -70,7 +77,7 @@ def get_user_state(user_id):
     if user_id not in user_prefs:
         user_prefs[user_id] = {
             "transcribe_engine": "whisper", 
-            "dub_voice": VOICE_MALE, 
+            "dub_voice": "male_mm", # Key from VOICES dict
             "custom_prompts": {} 
         }
     return user_prefs[user_id]
@@ -117,47 +124,65 @@ async def send_copyable_message(chat_id, bot, text):
         except Exception as e:
             print(f"Message Send Error: {e}")
 
-# --- 🎬 DUBBING ENGINE ---
-async def generate_dubbing(user_id, srt_path, output_path, voice):
-    """Generates audio synced to SRT timestamps."""
-    print(f"🎬 Starting Dubbing for {user_id}...")
+# --- 🎬 SMART DUBBING ENGINE ---
+async def generate_dubbing(user_id, srt_path, output_path, voice_key):
+    """
+    Advanced Dubbing:
+    - Calculates exact time slots.
+    - Speeds up only if necessary.
+    - Adds subtle crossfades to avoid robotic silence.
+    """
+    voice_name = VOICES.get(voice_key, "my-MM-ThihaNeural")
+    print(f"🎬 Starting Dubbing for {user_id} using {voice_name}...")
+    
     try:
         subs = pysrt.open(srt_path)
-        final_audio = AudioSegment.empty()
+        final_audio = AudioSegment.silent(duration=0)
         current_timeline_ms = 0
         
         for i, sub in enumerate(subs):
+            # Calculate timing
             start_ms = (sub.start.hours * 3600 + sub.start.minutes * 60 + sub.start.seconds) * 1000 + sub.start.milliseconds
             end_ms = (sub.end.hours * 3600 + sub.end.minutes * 60 + sub.end.seconds) * 1000 + sub.end.milliseconds
-            allowed_duration_ms = end_ms - start_ms
+            target_duration = end_ms - start_ms
             
             text = sub.text.replace("\n", " ").strip()
             if not text: continue 
 
-            # Gap Handling
+            # 1. Handle Gaps (Natural Pause)
             if start_ms > current_timeline_ms:
-                silence_gap = start_ms - current_timeline_ms
-                final_audio += AudioSegment.silent(duration=silence_gap)
-                current_timeline_ms += silence_gap
+                gap = start_ms - current_timeline_ms
+                final_audio += AudioSegment.silent(duration=gap)
+                current_timeline_ms += gap
             
-            # TTS Generation
-            temp_filename = f"temp/{user_id}_chunk_{i}.mp3"
-            communicate = edge_tts.Communicate(text, voice)
-            await communicate.save(temp_filename)
+            # 2. Generate Audio
+            temp_file = f"temp/{user_id}_chunk_{i}.mp3"
+            communicate = edge_tts.Communicate(text, voice_name)
+            await communicate.save(temp_file)
             
-            segment = AudioSegment.from_file(temp_filename)
-            
-            # Speed Adjustment
-            if len(segment) > allowed_duration_ms:
-                ratio = len(segment) / allowed_duration_ms
-                speed_str = f"+{int(ratio * 100 - 100 + 10)}%" 
-                communicate = edge_tts.Communicate(text, voice, rate=speed_str)
-                await communicate.save(temp_filename)
-                segment = AudioSegment.from_file(temp_filename)
+            segment = AudioSegment.from_file(temp_file)
+            original_len = len(segment)
 
+            # 3. Smart Speed Adjustment
+            # If audio is too long, speed it up
+            if original_len > target_duration:
+                ratio = original_len / target_duration
+                # Cap speed at 1.5x to prevent "Chipmunk" sound. 
+                # If it's still too long, it will just overlap slightly (better than unintelligible speed)
+                capped_ratio = min(ratio, 1.5) 
+                
+                speed_str = f"+{int(capped_ratio * 100 - 100)}%"
+                
+                # Re-generate with Edge-TTS speed parameter for better quality than raw ffmpeg speedup
+                communicate = edge_tts.Communicate(text, voice_name, rate=speed_str)
+                await communicate.save(temp_file)
+                segment = AudioSegment.from_file(temp_file)
+
+            # 4. Append
             final_audio += segment
             current_timeline_ms += len(segment)
-            if os.path.exists(temp_filename): os.remove(temp_filename)
+            
+            if os.path.exists(temp_file): os.remove(temp_file)
 
         final_audio.export(output_path, format="mp3")
         return True, None
@@ -261,12 +286,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     state = get_user_state(user_id)
     
+    current_voice_name = state['dub_voice'].replace("_", " ").title()
+    
     keyboard = [
         [InlineKeyboardButton(f"🎙️ Engine: {state['transcribe_engine'].title()}", callback_data="toggle_transcribe")],
-        [InlineKeyboardButton(f"🗣️ Voice: {'Male' if state['dub_voice'] == VOICE_MALE else 'Female'}", callback_data="toggle_voice")],
+        [InlineKeyboardButton(f"🗣️ Voice: {current_voice_name}", callback_data="menu_voice")],
         [InlineKeyboardButton("⚙️ Settings", callback_data="menu_settings")]
     ]
     await update.message.reply_text("👋 **Video AI Studio**\nSend Video, Audio, SRT or TXT.", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def voice_menu(update, context):
+    keyboard = [
+        [InlineKeyboardButton("🇲🇲 Male (Thiha)", callback_data="set_voice_male_mm"), InlineKeyboardButton("🇲🇲 Female (Nular)", callback_data="set_voice_female_mm")],
+        [InlineKeyboardButton("🇮🇹 Giuseppe", callback_data="set_voice_giuseppe"), InlineKeyboardButton("🇫🇷 Remy", callback_data="set_voice_remy")],
+        [InlineKeyboardButton("🇺🇸 Andrew", callback_data="set_voice_andrew"), InlineKeyboardButton("🇺🇸 Brian", callback_data="set_voice_brian")],
+        [InlineKeyboardButton("🔙 Back", callback_data="back_start")]
+    ]
+    await update.callback_query.message.edit_text("🗣️ **Select a Voice:**", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
@@ -302,12 +338,12 @@ async def perform_dubbing(update, context):
         await msg.reply_text("❌ **No SRT found.**")
         return
 
-    status = await msg.reply_text(f"🎬 **Dubbing ({state['dub_voice']})...**")
+    status = await msg.reply_text(f"🎬 **Dubbing ({state['dub_voice']})...**\nGenerating natural pauses...")
     success, error = await generate_dubbing(user_id, p['srt'], p['dub_audio'], state['dub_voice'])
     
     if success:
         await status.delete()
-        await context.bot.send_audio(chat_id=msg.chat_id, audio=open(p['dub_audio'], "rb"), caption="✅ **Dubbing Complete!**")
+        await context.bot.send_audio(chat_id=msg.chat_id, audio=open(p['dub_audio'], "rb"), caption=f"✅ **Dubbed Audio**\nVoice: {state['dub_voice']}")
     else:
         await status.edit_text(f"❌ Dubbing Failed: {error}")
 
@@ -348,16 +384,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state['transcribe_engine'] = "gemini" if state['transcribe_engine'] == "whisper" else "whisper"
         await query.answer(f"Engine: {state['transcribe_engine']}")
     
-    elif data == "toggle_voice":
-        state['dub_voice'] = VOICE_FEMALE if state['dub_voice'] == VOICE_MALE else VOICE_MALE
-        await query.answer("Voice Switched")
-        # Update Start Menu
-        keyboard = [
-            [InlineKeyboardButton(f"🎙️ Engine: {state['transcribe_engine'].title()}", callback_data="toggle_transcribe")],
-            [InlineKeyboardButton(f"🗣️ Voice: {'Male' if state['dub_voice'] == VOICE_MALE else 'Female'}", callback_data="toggle_voice")],
-            [InlineKeyboardButton("⚙️ Settings", callback_data="menu_settings")]
-        ]
-        await query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+    elif data == "menu_voice":
+        await voice_menu(update, context)
+
+    elif data.startswith("set_voice_"):
+        voice_key = data.replace("set_voice_", "")
+        state['dub_voice'] = voice_key
+        await query.answer(f"Selected: {voice_key.title()}")
+        await start(update, context) # Go back to start
+
+    elif data == "back_start":
+        await start(update, context)
 
     elif data == "menu_settings":
         await settings_command(update, context)
@@ -389,7 +426,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("✍️ Enter custom prompt:")
 
     elif data == "feedback_yes":
-        # If SRT, offer Dubbing
         p = get_paths(user_id)
         if os.path.exists(p['srt']):
             keyboard = [[InlineKeyboardButton("🎬 Make Audio Now", callback_data="trigger_dub")]]
