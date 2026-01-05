@@ -4,3 +4,5 @@ faster-whisper
 pysrt
 yt-dlp
 torch
+edge-tts
+pydub
