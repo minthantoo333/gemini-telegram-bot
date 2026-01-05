@@ -9,7 +9,7 @@ import math
 import shutil
 
 # Audio Processing
-from pydub import AudioSegment
+from pydub import AudioSegment, effects
 import edge_tts
 
 # Telegram
@@ -30,7 +30,6 @@ if not TG_TOKEN or not GEMINI_KEY:
     exit()
 
 # --- 🗣️ VOICE LIBRARY ---
-# Keys are display names, Values are Edge-TTS internal IDs
 VOICE_LIB = {
     "🇲🇲 Burmese (Male)": "my-MM-ThihaNeural",
     "🇲🇲 Burmese (Female)": "my-MM-NularNeural",
@@ -77,7 +76,7 @@ def get_user_state(user_id):
     if user_id not in user_prefs:
         user_prefs[user_id] = {
             "transcribe_engine": "whisper", 
-            "dub_voice": "my-MM-ThihaNeural", # Default to Burmese Male
+            "dub_voice": "my-MM-ThihaNeural", 
             "custom_prompts": {} 
         }
     return user_prefs[user_id]
@@ -124,9 +123,27 @@ async def send_copyable_message(chat_id, bot, text):
         except Exception as e:
             print(f"Message Send Error: {e}")
 
+# --- 🔊 AUDIO POST-PROCESSING ---
+def make_audio_crisp(audio_segment):
+    """
+    Applies filters to make voice sound sharper and clearer.
+    """
+    # 1. High Pass Filter (Cuts muddy bass below 200Hz)
+    clean_audio = audio_segment.high_pass_filter(200)
+    
+    # 2. Treble Boost (Emphasis on 2kHz-4kHz range for clarity)
+    # Pydub doesn't have a direct EQ, so we simulate it by overlaying high frequencies
+    high_freqs = clean_audio.high_pass_filter(2000)
+    crisp_audio = clean_audio.overlay(high_freqs - 2) # Add highs back slightly quieter
+    
+    # 3. Normalize Volume (Make it loud and consistent)
+    final_audio = effects.normalize(crisp_audio)
+    
+    return final_audio
+
 # --- 🎬 DUBBING ENGINE ---
 async def generate_dubbing(user_id, srt_path, output_path, voice):
-    """Generates audio synced to SRT timestamps with natural speed adjustment."""
+    """Generates audio synced to SRT timestamps with natural speed + Crisp Filter."""
     print(f"🎬 Starting Dubbing for {user_id} using {voice}...")
     try:
         subs = pysrt.open(srt_path)
@@ -154,18 +171,18 @@ async def generate_dubbing(user_id, srt_path, output_path, voice):
             
             segment = AudioSegment.from_file(temp_filename)
             
-            # Smart Speed Adjustment
-            # If segment is longer than allowed time, speed it up comfortably
+            # Speed Adjustment
             if len(segment) > allowed_duration_ms:
                 ratio = len(segment) / allowed_duration_ms
-                # Add 5% buffer to ensure it fits comfortably
                 percentage = int(ratio * 100 - 100 + 5)
                 speed_str = f"+{percentage}%" 
-                
-                # Re-generate with calculated speed
                 communicate = edge_tts.Communicate(text, voice, rate=speed_str)
                 await communicate.save(temp_filename)
                 segment = AudioSegment.from_file(temp_filename)
+
+            # --- APPLY CRISP FILTER HERE ---
+            segment = make_audio_crisp(segment)
+            # -------------------------------
 
             final_audio += segment
             current_timeline_ms += len(segment)
@@ -242,7 +259,7 @@ async def run_translate(user_id, prompt_text):
         content = response.text.strip().replace("```srt", "").replace("```", "").strip()
         final_path = p['trans_result'] + output_ext
         with open(final_path, "w", encoding="utf-8") as f: f.write(content)
-        if is_srt: shutil.copy(final_path, p['srt']) # Update SRT for dubbing
+        if is_srt: shutil.copy(final_path, p['srt']) 
         return True, content, final_path
     except Exception as e:
         return False, str(e), None
@@ -274,10 +291,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     state = get_user_state(user_id)
     
-    # Get Friendly Name of current voice
-    current_voice_id = state['dub_voice']
-    voice_name = next((k for k, v in VOICE_LIB.items() if v == current_voice_id), "Unknown")
-
+    voice_name = next((k for k, v in VOICE_LIB.items() if v == state['dub_voice']), "Unknown")
     keyboard = [
         [InlineKeyboardButton(f"🎙️ Engine: {state['transcribe_engine'].title()}", callback_data="toggle_transcribe")],
         [InlineKeyboardButton(f"🗣️ Voice: {voice_name}", callback_data="cmd_voices")],
@@ -287,7 +301,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def voices_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = []
-    # Create 2-column layout for voices
     row = []
     for name, code in VOICE_LIB.items():
         row.append(InlineKeyboardButton(name, callback_data=f"set_voice_{code}"))
@@ -295,7 +308,6 @@ async def voices_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             keyboard.append(row)
             row = []
     if row: keyboard.append(row)
-    
     await update.message.reply_text("🗣️ **Select Narrator Voice:**", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -332,9 +344,8 @@ async def perform_dubbing(update, context):
         await msg.reply_text("❌ **No SRT found.**")
         return
 
-    # Find display name for status message
     voice_name = next((k for k, v in VOICE_LIB.items() if v == state['dub_voice']), "Selected Voice")
-    status = await msg.reply_text(f"🎬 **Dubbing with {voice_name}...**")
+    status = await msg.reply_text(f"🎬 **Dubbing ({voice_name})...**")
     
     success, error = await generate_dubbing(user_id, p['srt'], p['dub_audio'], state['dub_voice'])
     
@@ -363,7 +374,6 @@ async def perform_translation(update, context, user_id, prompt):
         await status.delete()
         await context.bot.send_document(msg.chat_id, document=open(path, "rb"), caption="✅ **Translation Done.**")
         
-        # Feedback + Upsell Dubbing
         keyboard = [
             [InlineKeyboardButton("✅ Good", callback_data="feedback_yes"), InlineKeyboardButton("❌ Bad", callback_data="feedback_no")]
         ]
@@ -382,14 +392,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer(f"Engine: {state['transcribe_engine']}")
     
     elif data == "cmd_voices":
-        await voices_command(query, context) # Open voice menu
+        await voices_command(query, context)
         await query.answer()
 
     elif data.startswith("set_voice_"):
         new_voice = data.replace("set_voice_", "")
         state['dub_voice'] = new_voice
-        
-        # Find display name for confirmation
         v_name = next((k for k, v in VOICE_LIB.items() if v == new_voice), "Custom Voice")
         await query.message.edit_text(f"✅ Voice set to: **{v_name}**")
 
