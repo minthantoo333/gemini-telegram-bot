@@ -5,7 +5,12 @@ import glob
 import subprocess
 import torch
 import pysrt
+import math
 import shutil
+
+# Audio Processing
+from pydub import AudioSegment
+import edge_tts
 
 # Telegram
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
@@ -20,32 +25,29 @@ from faster_whisper import WhisperModel
 TG_TOKEN = os.getenv("TG_TOKEN")
 GEMINI_KEY = os.getenv("GEMINI_KEY")
 
+# Voices
+VOICE_MALE = "my-MM-ThihaNeural"
+VOICE_FEMALE = "my-MM-NularNeural"
+
 if not TG_TOKEN or not GEMINI_KEY:
     print("❌ ERROR: API Keys are missing! Set them in your environment variables.")
     exit()
 
-# --- 📝 PROMPTS & RULES ---
-
-# Core Burmese Style Rules (Applied to both TXT and SRT)
-BURMESE_STYLE = """
-Role: Professional Video Narrator & Translator (Burmese).
-Strict Translation Guidelines:
-1. **Style:** Translate as a **Natural Narrator**. Professional, clear, and engaging.
-2. **Multi-Language:** Translate EVERYTHING (English, Korean, etc.) into natural Burmese.
-3. **No Brackets:** NEVER keep original words in brackets. (e.g., Use စီအီးအို, not စီအီးအို (CEO)).
-4. **Abbreviations:** Transliterate phonetically (e.g., VIP → ဗီအိုင်ပီ, FBI → အက်ဖ်ဘီအိုင်).
-5. **Forbidden:** Do NOT use the word 'ပေါ့' (pout). Use professional sentence endings.
-"""
-
-# Wrapper for SRT Files to protect timestamps
+# --- 📝 PROMPTS ---
 SRT_RULES = """
 **FORMATTING INSTRUCTIONS (STRICT):**
 1. The input is an **SRT Subtitle File**.
 2. **OUTPUT FORMAT:** You MUST return a valid SRT file.
-3. **TIMESTAMPS:** Do NOT change, shift, or remove any timestamps. They must remain exactly as they are in the source.
-4. **SEQUENCE NUMBERS:** Preserve the exact sequence numbers (1, 2, 3...).
-5. **CONTENT:** Only translate the text content inside the subtitle blocks using the Style Guidelines above.
-6. **NO EXTRA TEXT:** Do not add "Here is the translation". Just output the raw SRT data.
+3. **TIMESTAMPS:** Do NOT change, shift, or remove any timestamps. 
+4. **SEQUENCE NUMBERS:** Preserve exact sequence.
+5. **TRANSLATION:** Translate text to natural Burmese.
+6. **LOAN WORDS:** Phonetic spelling for English terms (e.g., CEO -> စီအီးအို).
+"""
+
+BURMESE_STYLE = """
+Role: Professional Video Narrator (Burmese).
+Style: Natural, engaging, clear narration.
+No 'ပေါ့' (pout) at end of sentences.
 """
 
 DEFAULT_PROMPTS = {
@@ -67,7 +69,8 @@ chat_histories = {}
 def get_user_state(user_id):
     if user_id not in user_prefs:
         user_prefs[user_id] = {
-            "transcribe_engine": "whisper", # Default to Whisper for SRT capability
+            "transcribe_engine": "whisper", 
+            "dub_voice": VOICE_MALE, 
             "custom_prompts": {} 
         }
     return user_prefs[user_id]
@@ -83,18 +86,22 @@ def get_paths(user_id):
         "audio": f"downloads/{user_id}_audio.mp3",
         "srt": f"downloads/{user_id}_subs.srt",
         "txt": f"downloads/{user_id}_transcript.txt",
-        "trans_result": f"downloads/{user_id}_translated" # Extension added dynamically
+        "trans_result": f"downloads/{user_id}_translated",
+        "dub_audio": f"downloads/{user_id}_dubbed.mp3"
     }
 
 def clean_temp(user_id):
     p = get_paths(user_id)
     if os.path.exists(p['input']): os.remove(p['input'])
+    for f in glob.glob(f"temp/{user_id}_chunk_*.mp3"):
+        try: os.remove(f)
+        except: pass
 
 def wipe_user_data(user_id):
     for f in glob.glob(f"downloads/{user_id}_*"):
         try: os.remove(f)
         except: pass
-    
+    clean_temp(user_id)
     if user_id in user_prefs: del user_prefs[user_id]
     if user_id in user_modes: del user_modes[user_id]
     if user_id in chat_histories: del chat_histories[user_id]
@@ -110,15 +117,59 @@ async def send_copyable_message(chat_id, bot, text):
         except Exception as e:
             print(f"Message Send Error: {e}")
 
-# --- 🧠 ENGINES ---
+# --- 🎬 DUBBING ENGINE ---
+async def generate_dubbing(user_id, srt_path, output_path, voice):
+    """Generates audio synced to SRT timestamps."""
+    print(f"🎬 Starting Dubbing for {user_id}...")
+    try:
+        subs = pysrt.open(srt_path)
+        final_audio = AudioSegment.empty()
+        current_timeline_ms = 0
+        
+        for i, sub in enumerate(subs):
+            start_ms = (sub.start.hours * 3600 + sub.start.minutes * 60 + sub.start.seconds) * 1000 + sub.start.milliseconds
+            end_ms = (sub.end.hours * 3600 + sub.end.minutes * 60 + sub.end.seconds) * 1000 + sub.end.milliseconds
+            allowed_duration_ms = end_ms - start_ms
+            
+            text = sub.text.replace("\n", " ").strip()
+            if not text: continue 
 
+            # Gap Handling
+            if start_ms > current_timeline_ms:
+                silence_gap = start_ms - current_timeline_ms
+                final_audio += AudioSegment.silent(duration=silence_gap)
+                current_timeline_ms += silence_gap
+            
+            # TTS Generation
+            temp_filename = f"temp/{user_id}_chunk_{i}.mp3"
+            communicate = edge_tts.Communicate(text, voice)
+            await communicate.save(temp_filename)
+            
+            segment = AudioSegment.from_file(temp_filename)
+            
+            # Speed Adjustment
+            if len(segment) > allowed_duration_ms:
+                ratio = len(segment) / allowed_duration_ms
+                speed_str = f"+{int(ratio * 100 - 100 + 10)}%" 
+                communicate = edge_tts.Communicate(text, voice, rate=speed_str)
+                await communicate.save(temp_filename)
+                segment = AudioSegment.from_file(temp_filename)
+
+            final_audio += segment
+            current_timeline_ms += len(segment)
+            if os.path.exists(temp_filename): os.remove(temp_filename)
+
+        final_audio.export(output_path, format="mp3")
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+# --- 🧠 ENGINES ---
 def run_whisper(audio_path, srt_path, txt_path):
-    print(f"🎙️ [Whisper] Processing {audio_path}...")
+    print(f"🎙️ [Whisper] Processing...")
     try:
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        # Use float32 on CPU to avoid warnings, float16 on GPU
         compute_type = "float16" if device == "cuda" else "int8"
-        
         model = WhisperModel("small", device=device, compute_type=compute_type)
         segments, _ = model.transcribe(audio_path, beam_size=5)
         
@@ -127,46 +178,28 @@ def run_whisper(audio_path, srt_path, txt_path):
                 start = format_timestamp(segment.start)
                 end = format_timestamp(segment.end)
                 text = segment.text.strip()
-                # Write SRT
                 srt.write(f"{i}\n{start} --> {end}\n{text}\n\n")
-                # Write TXT
                 txt.write(f"{text} ")
         return "Whisper (Local)"
     except Exception as e:
-        print(f"Whisper Error: {e}")
-        return "Error"
+        return f"Error: {e}"
 
 def run_gemini_transcribe(audio_path, srt_path, txt_path):
-    print(f"✨ [Gemini] Listening to {audio_path}...")
+    print(f"✨ [Gemini] Listening...")
     try:
         client = genai.Client(api_key=GEMINI_KEY)
-        with open(audio_path, "rb") as f:
-            audio_bytes = f.read()
-            
-        prompt = "Transcribe this audio into a clean, readable text transcript. Do not use timestamps."
+        with open(audio_path, "rb") as f: audio_bytes = f.read()
         response = client.models.generate_content(
             model='gemini-2.0-flash',
-            contents=[
-                types.Content(
-                    parts=[
-                        types.Part.from_bytes(data=audio_bytes, mime_type="audio/mp3"),
-                        types.Part.from_text(text=prompt)
-                    ]
-                )
-            ]
+            contents=[types.Content(parts=[types.Part.from_bytes(data=audio_bytes, mime_type="audio/mp3"), types.Part.from_text(text="Transcribe to text.")])]
         )
-        txt_content = response.text.strip()
-        with open(txt_path, "w", encoding="utf-8") as f: f.write(txt_content)
-        # Delete SRT if it exists from previous run so translation doesn't use old SRT
-        if os.path.exists(srt_path): os.remove(srt_path)
-        
-        return "Gemini 2.0 Flash"
+        with open(txt_path, "w", encoding="utf-8") as f: f.write(response.text.strip())
+        if os.path.exists(srt_path): os.remove(srt_path) 
+        return "Gemini Flash"
     except Exception as e:
-        print(f"Gemini Error: {e}")
         return "Error"
 
 def format_timestamp(seconds):
-    import math
     hours = math.floor(seconds / 3600)
     seconds %= 3600
     minutes = math.floor(seconds / 60)
@@ -175,67 +208,32 @@ def format_timestamp(seconds):
     return f"{hours:02}:{minutes:02}:{math.floor(seconds):02},{milliseconds:03}"
 
 # --- 🧠 TRANSLATION ---
-
 async def run_translate(user_id, prompt_text):
     p = get_paths(user_id)
-    
-    # 1. Determine Source (Prioritize SRT for subtitles)
-    source_path = None
-    is_srt = False
-    
-    if os.path.exists(p['srt']):
-        source_path = p['srt']
-        is_srt = True
-    elif os.path.exists(p['txt']):
-        source_path = p['txt']
-        is_srt = False
-    
-    if not source_path: return False, "❌ No content found to translate.", None
+    source_path = p['srt'] if os.path.exists(p['srt']) else p['txt'] if os.path.exists(p['txt']) else None
+    if not source_path: return False, "❌ No file found.", None
 
-    print(f"🌍 Translating {source_path} (Is SRT: {is_srt})...")
+    is_srt = source_path.endswith('.srt')
     client = genai.Client(api_key=GEMINI_KEY)
     
     with open(source_path, "r", encoding="utf-8") as f: original_text = f.read()
     
-    # 2. Construct Prompt based on file type
     if is_srt:
-        # Combined Prompt: User Style + Strict SRT Rules
-        ai_prompt = f"""
-        {SRT_RULES}
-        
-        {prompt_text}
-        
-        **INPUT SRT DATA:**
-        {original_text}
-        """
+        ai_prompt = f"{SRT_RULES}\n{prompt_text}\n\n**INPUT SRT:**\n{original_text}"
         output_ext = ".srt"
     else:
-        # Standard Text Prompt
-        ai_prompt = f"""
-        User Instruction: "{prompt_text}"
-        
-        Input Text:
-        {original_text}
-        """
+        ai_prompt = f"User Instruction: {prompt_text}\n\nInput Text:\n{original_text}"
         output_ext = ".txt"
     
-    # 3. Call AI
     try:
         response = client.models.generate_content(model='gemini-2.0-flash', contents=ai_prompt)
-        translated_content = response.text.strip()
-        
-        if not translated_content: return False, "❌ AI returned empty translation.", None
-
-        # Clean up markdown code blocks if AI added them
-        if translated_content.startswith("```"):
-            translated_content = translated_content.replace("```srt", "").replace("```", "").strip()
-
+        content = response.text.strip().replace("```srt", "").replace("```", "").strip()
         final_path = p['trans_result'] + output_ext
-        with open(final_path, "w", encoding="utf-8") as f: f.write(translated_content)
-            
-        return True, translated_content, final_path
+        with open(final_path, "w", encoding="utf-8") as f: f.write(content)
+        if is_srt: shutil.copy(final_path, p['srt']) # Update SRT for dubbing
+        return True, content, final_path
     except Exception as e:
-        return False, f"Error: {str(e)}", None
+        return False, str(e), None
 
 async def run_chat_gemini(user_id, text):
     if user_id not in chat_histories: chat_histories[user_id] = []
@@ -248,17 +246,16 @@ async def run_chat_gemini(user_id, text):
         return f"Gemini Error: {e}"
 
 # --- 🤖 HANDLERS ---
-
 async def post_init(application):
-    commands = [
-        BotCommand("start", "🏠 Home Menu"),
-        BotCommand("settings", "⚙️ Prompt Settings"),
-        BotCommand("translate", "🌍 Translate File"),
-        BotCommand("heygemini", "🤖 Chat with Gemini"),
-        BotCommand("clearall", "🧹 Clear History"),
+    await application.bot.set_my_commands([
+        BotCommand("start", "🏠 Home"),
+        BotCommand("settings", "⚙️ Prompts"),
+        BotCommand("translate", "🌍 Translate"),
+        BotCommand("dub", "🎬 Dub Audio"),
+        BotCommand("heygemini", "🤖 Chat"),
+        BotCommand("clearall", "🧹 Clear"),
         BotCommand("cancel", "❌ Cancel")
-    ]
-    await application.bot.set_my_commands(commands)
+    ])
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -266,86 +263,80 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keyboard = [
         [InlineKeyboardButton(f"🎙️ Engine: {state['transcribe_engine'].title()}", callback_data="toggle_transcribe")],
-        [InlineKeyboardButton("⚙️ Prompt Settings", callback_data="menu_settings")]
+        [InlineKeyboardButton(f"🗣️ Voice: {'Male' if state['dub_voice'] == VOICE_MALE else 'Female'}", callback_data="toggle_voice")],
+        [InlineKeyboardButton("⚙️ Settings", callback_data="menu_settings")]
     ]
-    
-    await update.message.reply_text(
-        "👋 **Video AI Studio**\n\n"
-        "1️⃣ **Send Video/Link** → Extract & Transcribe\n"
-        "2️⃣ **Send .TXT/.SRT** → Load file\n"
-        "3️⃣ **Type `/translate`** → Translate\n\n"
-        "🗑️ **`/clearall`** to reset.",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-async def clearall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    wipe_user_data(user_id)
-    await update.message.reply_text("🧹 **All files and history cleared!**")
-
-async def heygemini_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_modes[user_id] = "chat_gemini"
-    await update.message.reply_text("🤖 **Gemini Chat Mode ON**\n\nI am listening. Talk to me!\n(Type `/cancel` to exit)")
+    await update.message.reply_text("👋 **Video AI Studio**\nSend Video, Audio, SRT or TXT.", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("📝 View Prompts", callback_data="st_view")],
         [InlineKeyboardButton("✏️ Edit Burmese", callback_data="st_edit_burmese")],
         [InlineKeyboardButton("✏️ Edit Rephrase", callback_data="st_edit_rephrase")],
-        [InlineKeyboardButton("🔄 Reset Defaults", callback_data="st_reset")],
-        [InlineKeyboardButton("🔙 Back", callback_data="st_back")]
+        [InlineKeyboardButton("🔄 Reset", callback_data="st_reset")]
     ]
     await update.message.reply_text("⚙️ **Prompt Settings**", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def heygemini_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_modes[update.effective_user.id] = "chat_gemini"
+    await update.message.reply_text("🤖 **Gemini Chat Mode ON**\nType `/cancel` to exit.")
+
+async def clearall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    wipe_user_data(update.effective_user.id)
+    await update.message.reply_text("🧹 **Cleared.**")
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_modes[update.effective_user.id] = None
+    await update.message.reply_text("✅ Mode exited.")
+
+async def dub_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await perform_dubbing(update, context)
+
+async def perform_dubbing(update, context):
+    user_id = update.effective_user.id
+    p = get_paths(user_id)
+    state = get_user_state(user_id)
+    msg = update.effective_message
+
+    if not os.path.exists(p['srt']):
+        await msg.reply_text("❌ **No SRT found.**")
+        return
+
+    status = await msg.reply_text(f"🎬 **Dubbing ({state['dub_voice']})...**")
+    success, error = await generate_dubbing(user_id, p['srt'], p['dub_audio'], state['dub_voice'])
+    
+    if success:
+        await status.delete()
+        await context.bot.send_audio(chat_id=msg.chat_id, audio=open(p['dub_audio'], "rb"), caption="✅ **Dubbing Complete!**")
+    else:
+        await status.edit_text(f"❌ Dubbing Failed: {error}")
 
 async def translate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_modes[user_id] = None 
-    
-    # Check what files are available to inform user
-    p = get_paths(user_id)
-    file_info = ""
-    if os.path.exists(p['srt']): file_info = "\nDetected: 🎬 SRT Subtitle"
-    elif os.path.exists(p['txt']): file_info = "\nDetected: 📄 Text File"
-    
     keyboard = [
         [InlineKeyboardButton("🇲🇲 To Burmese", callback_data="trans_burmese")],
-        [InlineKeyboardButton("🇺🇸 Rephrase English", callback_data="trans_rephrase")],
-        [InlineKeyboardButton("✍️ Custom Prompt", callback_data="trans_custom")]
+        [InlineKeyboardButton("🇺🇸 Rephrase", callback_data="trans_rephrase")],
+        [InlineKeyboardButton("✍️ Custom", callback_data="trans_custom")]
     ]
-    
-    await update.message.reply_text(
-        f"🌍 **Select Translation Action:**{file_info}",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    await update.message.reply_text("🌍 **Translate Action:**", reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def perform_translation_logic(update, context, user_id, prompt):
+async def perform_translation(update, context, user_id, prompt):
     msg = update.effective_message
-    
     status = await msg.reply_text(f"🌍 **Translating...**")
+    success, _, path = await run_translate(user_id, prompt)
     
-    success, result_text, final_path = await run_translate(user_id, prompt)
-    
-    if success and final_path:
-        await context.bot.send_document(msg.chat_id, document=open(final_path, "rb"), caption="✅ Translated File")
+    if success:
         await status.delete()
+        await context.bot.send_document(msg.chat_id, document=open(path, "rb"), caption="✅ **Translation Done.**")
         
-        # Feedback
+        # Feedback + Upsell Dubbing
         keyboard = [
-            [InlineKeyboardButton("✅ Yes", callback_data="feedback_yes"), InlineKeyboardButton("❌ No", callback_data="feedback_no")]
+            [InlineKeyboardButton("✅ Good", callback_data="feedback_yes"), InlineKeyboardButton("❌ Bad", callback_data="feedback_no")]
         ]
-        await context.bot.send_message(
-            chat_id=msg.chat_id,
-            text="Translation ကိုကြိုက်ပါသလား? (Do you like it?)",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+        await context.bot.send_message(msg.chat_id, "Translation okay?", reply_markup=InlineKeyboardMarkup(keyboard))
     else:
-        await status.edit_text(result_text)
-
-async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_modes[user_id] = None
-    await update.message.reply_text("✅ Mode exited. Back to normal.")
+        await status.edit_text("❌ Error.")
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -354,186 +345,170 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     
     if data == "toggle_transcribe":
-        new_engine = "gemini" if state['transcribe_engine'] == "whisper" else "whisper"
-        state['transcribe_engine'] = new_engine
-        keyboard = [[InlineKeyboardButton(f"🎙️ Engine: {new_engine.title()}", callback_data="toggle_transcribe")]]
-        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
-
-    elif data == "menu_settings" or data == "st_back":
+        state['transcribe_engine'] = "gemini" if state['transcribe_engine'] == "whisper" else "whisper"
+        await query.answer(f"Engine: {state['transcribe_engine']}")
+    
+    elif data == "toggle_voice":
+        state['dub_voice'] = VOICE_FEMALE if state['dub_voice'] == VOICE_MALE else VOICE_MALE
+        await query.answer("Voice Switched")
+        # Update Start Menu
         keyboard = [
-            [InlineKeyboardButton("📝 View Prompts", callback_data="st_view")],
-            [InlineKeyboardButton("✏️ Edit Burmese", callback_data="st_edit_burmese")],
-            [InlineKeyboardButton("✏️ Edit Rephrase", callback_data="st_edit_rephrase")],
-            [InlineKeyboardButton("🔄 Reset Defaults", callback_data="st_reset")]
+            [InlineKeyboardButton(f"🎙️ Engine: {state['transcribe_engine'].title()}", callback_data="toggle_transcribe")],
+            [InlineKeyboardButton(f"🗣️ Voice: {'Male' if state['dub_voice'] == VOICE_MALE else 'Female'}", callback_data="toggle_voice")],
+            [InlineKeyboardButton("⚙️ Settings", callback_data="menu_settings")]
         ]
-        await query.message.edit_text("⚙️ **Prompt Settings**\nSelect an option:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data == "menu_settings":
+        await settings_command(update, context)
 
     elif data == "st_view":
-        burmese = get_active_prompt(user_id, "burmese")
-        rephrase = get_active_prompt(user_id, "rephrase")
-        await send_copyable_message(query.message.chat_id, context.bot, f"🇲🇲 **Burmese Rules:**\n{burmese}")
-        await send_copyable_message(query.message.chat_id, context.bot, f"🇺🇸 **Rephrase Rules:**\n{rephrase}")
-        await query.answer("Prompts sent above!")
-
-    elif data == "st_reset":
-        state['custom_prompts'] = {}
-        await query.answer("✅ Prompts reset to default!", show_alert=True)
+        await send_copyable_message(query.message.chat_id, context.bot, f"🇲🇲 **Burmese:**\n{get_active_prompt(user_id, 'burmese')}")
+        await send_copyable_message(query.message.chat_id, context.bot, f"🇺🇸 **Rephrase:**\n{get_active_prompt(user_id, 'rephrase')}")
 
     elif data == "st_edit_burmese":
         user_modes[user_id] = "edit_prompt_burmese"
-        await query.message.edit_text("✍️ **Send me the new prompt for BURMESE translation:**\n(Type `/cancel` to stop)")
-    
+        await query.message.edit_text("✍️ Send new Burmese prompt:")
+
     elif data == "st_edit_rephrase":
         user_modes[user_id] = "edit_prompt_rephrase"
-        await query.message.edit_text("✍️ **Send me the new prompt for REPHRASE translation:**\n(Type `/cancel` to stop)")
+        await query.message.edit_text("✍️ Send new Rephrase prompt:")
+
+    elif data == "st_reset":
+        state['custom_prompts'] = {}
+        await query.answer("Prompts Reset")
 
     elif data == "trans_burmese":
-        prompt = get_active_prompt(user_id, "burmese")
-        await perform_translation_logic(update, context, user_id, prompt)
-    
+        await perform_translation(update, context, user_id, get_active_prompt(user_id, "burmese"))
+
     elif data == "trans_rephrase":
-        prompt = get_active_prompt(user_id, "rephrase")
-        await perform_translation_logic(update, context, user_id, prompt)
-        
+        await perform_translation(update, context, user_id, get_active_prompt(user_id, "rephrase"))
+
     elif data == "trans_custom":
         user_modes[user_id] = "translate_prompt"
-        await query.message.reply_text("✍️ **Enter your custom prompt:**")
-    
+        await query.message.reply_text("✍️ Enter custom prompt:")
+
     elif data == "feedback_yes":
-        await query.message.edit_text("ကျေးဇူးတင်ပါတယ်! (Thanks!) ✅")
-        
+        # If SRT, offer Dubbing
+        p = get_paths(user_id)
+        if os.path.exists(p['srt']):
+            keyboard = [[InlineKeyboardButton("🎬 Make Audio Now", callback_data="trigger_dub")]]
+            await query.message.edit_text("✅ Great! Want dubbing?", reply_markup=InlineKeyboardMarkup(keyboard))
+        else:
+            await query.message.edit_text("✅ Thanks!")
+
     elif data == "feedback_no":
         user_modes[user_id] = "translate_prompt"
-        await query.message.edit_text("✍️ **ဘယ်လို ပြင်ဆင်ချင်ပါသလဲ? (Please type your custom prompt):**")
+        await query.message.edit_text("✍️ How should I fix it? (Enter Prompt):")
+
+    elif data == "trigger_dub":
+        await perform_dubbing(update, context)
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     user_id = msg.from_user.id
     text = msg.text
-    p = get_paths(user_id)
-    state = get_user_state(user_id)
     mode = user_modes.get(user_id)
+    state = get_user_state(user_id)
     
     if text.startswith("/cancel"):
-        user_modes[user_id] = None
-        await msg.reply_text("❌ Action Cancelled.")
+        await cancel_command(update, context)
         return
 
     if mode == "chat_gemini":
-        await context.bot.send_chat_action(chat_id=msg.chat_id, action="typing")
+        await context.bot.send_chat_action(msg.chat_id, "typing")
         response = await run_chat_gemini(user_id, text)
         await send_copyable_message(msg.chat_id, context.bot, response)
         return
 
     if mode == "edit_prompt_burmese":
-        if "custom_prompts" not in state: state['custom_prompts'] = {}
-        state['custom_prompts']['burmese'] = text
+        state.setdefault('custom_prompts', {})['burmese'] = text
         user_modes[user_id] = None
-        await msg.reply_text("✅ **Burmese Prompt Updated!**")
+        await msg.reply_text("✅ Burmese Prompt Updated.")
         return
 
     if mode == "edit_prompt_rephrase":
-        if "custom_prompts" not in state: state['custom_prompts'] = {}
-        state['custom_prompts']['rephrase'] = text
+        state.setdefault('custom_prompts', {})['rephrase'] = text
         user_modes[user_id] = None
-        await msg.reply_text("✅ **Rephrase Prompt Updated!**")
+        await msg.reply_text("✅ Rephrase Prompt Updated.")
         return
 
     if mode == "translate_prompt":
         user_modes[user_id] = None
-        await perform_translation_logic(update, context, user_id, text)
+        await perform_translation(update, context, user_id, text)
         return
 
     if "http" in text:
-        await process_video_logic(update, context, is_url=True)
-        return
-        
+        await process_media(update, context, is_url=True)
+
     if len(text) > 10:
+        p = get_paths(user_id)
         with open(p['txt'], "w", encoding="utf-8") as f: f.write(text)
-        await msg.reply_text("✅ **Text saved!**\nType `/translate`.")
-        return
+        await msg.reply_text("✅ Text Saved. Type `/translate`.")
 
 async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     user_id = msg.from_user.id
     p = get_paths(user_id)
-    
     file_obj = await (msg.document or msg.video or msg.audio).get_file()
-    name = msg.document.file_name if msg.document else "video.mp4"
+    name = msg.document.file_name if msg.document else "vid.mp4"
     
     if name.lower().endswith('.srt'):
-        await msg.reply_text(f"⬇️ **Saving Subtitle {name}...**")
+        await msg.reply_text("⬇️ **SRT Received.**")
         await file_obj.download_to_drive(p['srt'])
-        await msg.reply_text(f"✅ **SRT Loaded!**\nType `/translate` to translate subtitles.")
+        keyboard = [[InlineKeyboardButton("🎬 Dub Audio", callback_data="trigger_dub")]]
+        await msg.reply_text("✅ **SRT Loaded.**", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     if name.lower().endswith('.txt'):
-        await msg.reply_text(f"⬇️ **Saving Text {name}...**")
         await file_obj.download_to_drive(p['txt'])
-        await msg.reply_text(f"✅ **Text Loaded!**\nType `/translate`.")
+        await msg.reply_text("✅ **Text Loaded.** Type `/translate`.")
         return
         
-    await process_video_logic(update, context, is_url=False)
+    await process_media(update, context, is_url=False)
 
-async def process_video_logic(update, context, is_url):
+async def process_media(update, context, is_url):
     msg = update.message
     user_id = msg.from_user.id
     p = get_paths(user_id)
     state = get_user_state(user_id)
     
-    status = await msg.reply_text("⏳ **Downloading & Processing...**")
+    status = await msg.reply_text("⏳ **Processing...**")
     try:
         clean_temp(user_id)
-        
-        # Audio Extraction
         if is_url:
-            cmd = f"yt-dlp --no-check-certificate -f 'bestaudio/best' -x --audio-format mp3 -o '{p['audio']}' {msg.text}"
-            subprocess.run(cmd, shell=True)
+            subprocess.run(f"yt-dlp -x --audio-format mp3 -o '{p['audio']}' {msg.text}", shell=True)
         else:
             file_obj = await (msg.video or msg.document or msg.audio).get_file()
             await file_obj.download_to_drive(p['input'])
             subprocess.run(f"ffmpeg -y -i {p['input']} -vn -acodec libmp3lame -q:a 2 {p['audio']}", shell=True)
-            if os.path.exists(p['input']): os.remove(p['input'])
             
-        if not os.path.exists(p['audio']): raise Exception("Audio extraction failed.")
-        
-        await status.edit_text(f"🎙️ **Transcribing ({state['transcribe_engine']})...**")
         loop = asyncio.get_event_loop()
-        
-        # Transcribe
-        if state['transcribe_engine'] == "gemini":
-            engine_name = await loop.run_in_executor(None, run_gemini_transcribe, p['audio'], p['srt'], p['txt'])
+        if state['transcribe_engine'] == "whisper":
+            await loop.run_in_executor(None, run_whisper, p['audio'], p['srt'], p['txt'])
+            if os.path.exists(p['srt']):
+                await context.bot.send_document(msg.chat_id, open(p['srt'], "rb"), caption="🎬 Subtitles")
         else:
-            engine_name = await loop.run_in_executor(None, run_whisper, p['audio'], p['srt'], p['txt'])
+            await loop.run_in_executor(None, run_gemini_transcribe, p['audio'], p['srt'], p['txt'])
+            if os.path.exists(p['txt']):
+                 await context.bot.send_document(msg.chat_id, open(p['txt'], "rb"), caption="📄 Transcript")
             
-        # Send Results
-        await status.delete()
-        
-        if os.path.exists(p['txt']) and os.path.getsize(p['txt']) > 0:
-            await context.bot.send_document(msg.chat_id, document=open(p['txt'], "rb"), caption=f"📄 Transcript ({engine_name})")
-        
-        # KEY CHANGE: If using Whisper, also send SRT
-        if os.path.exists(p['srt']) and state['transcribe_engine'] == "whisper":
-            await context.bot.send_document(msg.chat_id, document=open(p['srt'], "rb"), caption=f"🎬 Subtitles ({engine_name})")
-
-        await context.bot.send_message(msg.chat_id, text="✅ **Finished!**\nType `/translate` to select action.")
+        await status.edit_text("✅ **Done!** Type `/translate` or `/dub`.")
 
     except Exception as e:
-        await status.edit_text(f"❌ Error: {str(e)}")
+        await status.edit_text(f"❌ Error: {e}")
 
 if __name__ == '__main__':
     print("🚀 Video AI Bot Running...")
     app = ApplicationBuilder().token(TG_TOKEN).post_init(post_init).build()
-    
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CommandHandler("heygemini", heygemini_command))
     app.add_handler(CommandHandler("translate", translate_command))
+    app.add_handler(CommandHandler("dub", dub_command))
     app.add_handler(CommandHandler("clearall", clearall_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
-    
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_handler))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.ALL | filters.AUDIO, file_handler))
-    
     app.run_polling()
