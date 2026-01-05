@@ -20,17 +20,19 @@ if not TG_TOKEN or not GEMINI_KEY:
     print("❌ ERROR: API Keys are missing! Set TG_TOKEN and GEMINI_KEY.")
     exit()
 
-# --- 🚀 GLOBAL AI MODELS ---
+# --- 🚀 GLOBAL AI MODELS (Load Once = Faster) ---
 print("⏳ Loading AI Models...")
 GENAI_CLIENT = genai.Client(api_key=GEMINI_KEY)
 
+# Load Whisper once to avoid reloading it for every user (Saves RAM)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 try:
+    print(f"   ...Loading Whisper on {device}...")
     GLOBAL_WHISPER = WhisperModel("small", device=device, compute_type="float16" if device=="cuda" else "int8")
     print(f"✅ Whisper loaded on {device}")
-except:
+except Exception as e:
     GLOBAL_WHISPER = None
-    print("⚠️ Whisper failed. Gemini will be used.")
+    print(f"⚠️ Whisper failed to load: {e}. Gemini will be used as default.")
 
 # --- 💾 STATE MANAGEMENT ---
 user_prefs = {}     # Settings: engine, format
@@ -55,29 +57,30 @@ def get_paths(user_id):
     }
 
 def cleanup_files(user_id):
-    p = get_paths(user_id)
     # Remove all files matching the user pattern
     for f in glob.glob(f"downloads/{user_id}*"):
         try: os.remove(f)
         except: pass
 
 def clean_gemini_srt_output(raw_text):
-    """Ensures Gemini output is valid SRT."""
+    """Ensures Gemini output is valid SRT by stripping Markdown and fixing timestamps."""
     clean = re.sub(r"```\w*\n", "", raw_text).replace("```", "")
     # Fix timestamps (00:00:00.000 -> 00:00:00,000)
     clean = re.sub(r'(\d{2}:\d{2}:\d{2})\.(\d{3})', r'\1,\2', clean)
     return clean.strip()
 
 async def download_media(msg, p):
-    """Smart download for URL or File."""
+    """Smart and SAFE download for URL or File."""
     try:
         if msg.text and "http" in msg.text:
+            # Secure download (no shell=True)
             cmd = ['yt-dlp', '--no-check-certificate', '-f', 'bestaudio/best', '-x', '--audio-format', 'mp3', '-o', p['audio'], msg.text]
             proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
             await proc.communicate()
         else:
             file_obj = await (msg.video or msg.audio or msg.document).get_file()
             await file_obj.download_to_drive(p['input'])
+            # Convert to MP3
             cmd = ['ffmpeg', '-y', '-i', p['input'], '-vn', '-acodec', 'libmp3lame', '-q:a', '2', p['audio']]
             proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
             await proc.wait()
@@ -90,7 +93,7 @@ async def download_media(msg, p):
 # --- 🧠 ENGINES ---
 
 def run_whisper_sync(audio_path, srt_path, txt_path):
-    if not GLOBAL_WHISPER: return "Whisper Error"
+    if not GLOBAL_WHISPER: return "Whisper Error (Not Loaded)"
     try:
         segments, _ = GLOBAL_WHISPER.transcribe(audio_path, beam_size=5)
         with open(srt_path, "w", encoding="utf-8") as srt, open(txt_path, "w", encoding="utf-8") as txt:
@@ -152,26 +155,42 @@ async def translate_file(user_id, ext):
     
     if not os.path.exists(src): return False, "File not found. Upload first."
     
-    prompt = "Translate to Burmese. Natural narrator style. No 'pout'. Phonetic English."
+    # --- PROMPTS ---
+    prompt = """
+    Role: Professional Video Narrator (Burmese).
+    
+    Guidelines:
+    1. **Style:** Natural narrator flow. Not stiff.
+    2. **Forbidden:** NEVER use 'ပေါ့' (pout). Use 'ပါ', 'တယ်', 'မယ်'.
+    3. **Loan Words:** Write English abbreviations phonetically (e.g. CIA -> စီအိုင်အေ).
+    4. **Format:** Keep strictly to the input format (SRT or Text).
+    """
     
     try:
+        # LOGIC: If SRT, split by lines to preserve timestamps
         if ext == 'srt':
             subs = pysrt.open(src, encoding='utf-8')
             texts = [s.text.replace('\n', ' ') for s in subs]
             block = "\n<SEP>\n".join(texts)
+            
             res = await asyncio.get_running_loop().run_in_executor(None, lambda: GENAI_CLIENT.models.generate_content(
-                model='gemini-2.0-flash', contents=f"{prompt}\n\nInput:\n{block}"
+                model='gemini-2.0-flash', 
+                contents=f"{prompt}\n\nINSTRUCTION: Translate these lines. Output must be separated by <SEP>.\n\nDATA:\n{block}"
             ))
+            
             lines = res.text.strip().split("<SEP>")
             for i, s in enumerate(subs):
                 if i < len(lines): s.text = lines[i].strip()
             subs.save(out, encoding='utf-8')
+            
+        # LOGIC: If TXT, just translate the whole block
         else:
             with open(src, 'r') as f: text = f.read()
             res = await asyncio.get_running_loop().run_in_executor(None, lambda: GENAI_CLIENT.models.generate_content(
-                model='gemini-2.0-flash', contents=f"{prompt}\n\n{text}"
+                model='gemini-2.0-flash', contents=f"{prompt}\n\nInput Text:\n{text}"
             ))
             with open(out, 'w') as f: f.write(res.text)
+            
         return True, "Success"
     except Exception as e:
         return False, str(e)
@@ -353,6 +372,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- 🚀 STARTUP ---
 if __name__ == '__main__':
+    # Ensure download folders exist
+    for f in ["downloads", "temp"]:
+        os.makedirs(f, exist_ok=True)
+        
     app = ApplicationBuilder().token(TG_TOKEN).build()
     
     # Commands
