@@ -6,7 +6,7 @@ import shlex
 import torch
 import pysrt
 import re
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, CallbackQueryHandler, filters
 from google import genai
 from google.genai import types
@@ -17,117 +17,148 @@ TG_TOKEN = os.getenv("TG_TOKEN")
 GEMINI_KEY = os.getenv("GEMINI_KEY")
 
 if not TG_TOKEN or not GEMINI_KEY:
-    print("❌ ERROR: API Keys are missing! Set TG_TOKEN and GEMINI_KEY.")
+    print("❌ ERROR: API Keys are missing!")
     exit()
 
 # --- 🚀 GLOBAL AI MODELS ---
 print("⏳ Loading AI Models...")
-
-# 1. Gemini
 GENAI_CLIENT = genai.Client(api_key=GEMINI_KEY)
 
-# 2. Whisper (Loaded but optional if user prefers Gemini)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 try:
     GLOBAL_WHISPER = WhisperModel("small", device=device, compute_type="float16" if device=="cuda" else "int8")
     print(f"✅ Whisper loaded on {device}")
 except:
     GLOBAL_WHISPER = None
-    print("⚠️ Whisper failed to load. Gemini will be used.")
+    print("⚠️ Whisper failed. Gemini will be used.")
 
-# --- 📝 PROMPTS & DEFAULTS ---
-DEFAULT_PROMPTS = {
-    "burmese": "Role: Professional Narrator. Translate to natural spoken Burmese. No 'pout'. Phonetic English.",
-}
-
-# --- 💾 USER SETTINGS ---
-# Stores: {'engine': 'gemini'|'whisper', 'format': 'ask'|'srt'|'txt'}
+# --- 💾 SETTINGS MANAGER ---
 user_prefs = {}
 
-def get_user_prefs(user_id):
+def get_prefs(user_id):
     if user_id not in user_prefs:
-        user_prefs[user_id] = {
-            "engine": "gemini",  # Default to Gemini
-            "format": "ask"      # Default to Ask every time
-        }
+        user_prefs[user_id] = {"engine": "gemini", "format": "ask"}
     return user_prefs[user_id]
 
-# --- 🛠️ FILES & HELPERS ---
+def get_settings_markup(user_id):
+    prefs = get_prefs(user_id)
+    
+    eng_gemini = "✅ Gemini" if prefs['engine'] == "gemini" else "Gemini"
+    eng_whisper = "✅ Whisper" if prefs['engine'] == "whisper" else "Whisper"
+    
+    fmt_ask = "✅ Ask Me" if prefs['format'] == "ask" else "Ask Me"
+    fmt_srt = "✅ Always SRT" if prefs['format'] == "srt" else "Always SRT"
+    fmt_txt = "✅ Always TXT" if prefs['format'] == "txt" else "Always TXT"
+
+    keyboard = [
+        [InlineKeyboardButton("🧠 AI Engine", callback_data="ignore")],
+        [InlineKeyboardButton(eng_gemini, callback_data="set_eng_gemini"),
+         InlineKeyboardButton(eng_whisper, callback_data="set_eng_whisper")],
+        
+        [InlineKeyboardButton("📄 Output Format", callback_data="ignore")],
+        [InlineKeyboardButton(fmt_ask, callback_data="set_fmt_ask")],
+        [InlineKeyboardButton(fmt_srt, callback_data="set_fmt_srt"),
+         InlineKeyboardButton(fmt_txt, callback_data="set_fmt_txt")],
+         
+        [InlineKeyboardButton("🔙 Done", callback_data="close_settings")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+# --- 🛠️ HELPER FUNCTIONS ---
 def get_paths(user_id):
     base = f"downloads/{user_id}"
     return {
         "input": f"{base}_input",
         "audio": f"{base}_audio.mp3",
-        "srt": f"{base}.srt",
-        "txt": f"{base}.txt",
-        "trans_srt": f"{base}_trans.srt",
-        "trans_txt": f"{base}_trans.txt"
+        "srt": f"{base}.srt", "txt": f"{base}.txt",
+        "trans_srt": f"{base}_trans.srt", "trans_txt": f"{base}_trans.txt"
     }
 
 def cleanup_files(user_id):
-    p = get_paths(user_id)
     for f in glob.glob(f"downloads/{user_id}*"):
         try: os.remove(f)
         except: pass
 
+def clean_gemini_srt_output(raw_text):
+    """
+    Cleans up Gemini's chatty output to ensure valid SRT format.
+    1. Removes markdown code blocks.
+    2. Removes Intro/Outro text.
+    3. Fixes timestamp format errors ('.' to ',').
+    """
+    # 1. Strip Markdown Code Blocks
+    clean = re.sub(r"```\w*\n", "", raw_text) # Remove ```srt
+    clean = clean.replace("```", "")          # Remove closing ```
+    
+    # 2. Extract only the part that looks like SRT
+    # (Looks for pattern: "1\n00:00...")
+    match = re.search(r'(\d+\s+\d{2}:\d{2}:\d{2}[,.]\d{3}\s+-->\s+\d{2}:\d{2}:\d{2}[,.]\d{3}[\s\S]*)', clean)
+    if match:
+        clean = match.group(1)
+    
+    # 3. Fix timestamps (SRT uses comma, not dot for milliseconds)
+    # 00:00:00.000 -> 00:00:00,000
+    clean = re.sub(r'(\d{2}:\d{2}:\d{2})\.(\d{3})', r'\1,\2', clean)
+    
+    return clean.strip()
+
 async def download_media(msg, p):
-    """Smart downloader for URL or File"""
     if msg.text and "http" in msg.text:
-        # URL Download
-        cmd = [
-            'yt-dlp', '--no-check-certificate', '-f', 'bestaudio/best',
-            '-x', '--audio-format', 'mp3', '-o', p['audio'], msg.text
-        ]
+        cmd = ['yt-dlp', '--no-check-certificate', '-f', 'bestaudio/best', '-x', '--audio-format', 'mp3', '-o', p['audio'], msg.text]
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         await proc.communicate()
     else:
-        # File Download
         file_obj = await (msg.video or msg.audio or msg.document).get_file()
         await file_obj.download_to_drive(p['input'])
-        # Convert
         cmd = ['ffmpeg', '-y', '-i', p['input'], '-vn', '-acodec', 'libmp3lame', '-q:a', '2', p['audio']]
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         await proc.wait()
-
     return os.path.exists(p['audio'])
 
-# --- 🧠 TRANSCRIPTION ENGINES ---
-
+# --- 🧠 ENGINES ---
 def run_whisper_sync(audio_path, srt_path, txt_path):
     if not GLOBAL_WHISPER: return "Whisper Error"
     segments, _ = GLOBAL_WHISPER.transcribe(audio_path, beam_size=5)
-    
     with open(srt_path, "w", encoding="utf-8") as srt, open(txt_path, "w", encoding="utf-8") as txt:
         for i, seg in enumerate(segments, 1):
-            start = format_timestamp(seg.start)
-            end = format_timestamp(seg.end)
-            text = seg.text.strip()
-            srt.write(f"{i}\n{start} --> {end}\n{text}\n\n")
-            txt.write(f"{text} ")
-    return "Whisper (Local)"
+            t = f"{format_timestamp(seg.start)} --> {format_timestamp(seg.end)}"
+            srt.write(f"{i}\n{t}\n{seg.text.strip()}\n\n")
+            txt.write(f"{seg.text.strip()} ")
+    return "Whisper"
 
 def run_gemini_sync(audio_path, srt_path, txt_path):
-    """Prompts Gemini to create an SRT directly."""
     try:
         with open(audio_path, "rb") as f: audio_bytes = f.read()
         
-        # Prompt for SRT format
-        prompt = "Transcribe this audio. Output the result strictly in SRT (SubRip) format with timestamps."
+        # STRICT Prompt for SRT
+        prompt = """
+        Transcribe the audio into SubRip (.srt) format.
+        STRICT RULES:
+        1. Output ONLY the SRT content. Do not add "Here is the srt" or markdown.
+        2. Use correct timestamp format: 00:00:00,000 --> 00:00:00,000 (Comma for ms).
+        3. Ensure lines are broken naturally.
+        """
         
         response = GENAI_CLIENT.models.generate_content(
             model='gemini-2.0-flash',
-            contents=[types.Content(parts=[
-                types.Part.from_bytes(data=audio_bytes, mime_type="audio/mp3"),
-                types.Part.from_text(text=prompt)
-            ])]
+            contents=[types.Content(parts=[types.Part.from_bytes(audio_bytes, "audio/mp3"), types.Part.from_text(prompt)])]
         )
-        content = response.text.strip()
         
-        # Save SRT
-        with open(srt_path, "w", encoding="utf-8") as f: f.write(content)
+        # CLEANUP ROUTINE
+        raw_content = response.text.strip()
+        clean_content = clean_gemini_srt_output(raw_content)
         
-        # Extract Text from SRT (Simple regex cleanup)
-        clean_text = re.sub(r'\d+\n\d{2}:\d{2}:\d{2},\d{3} --> \d{2}:\d{2}:\d{2},\d{3}\n', '', content)
+        # Validation: Check if it actually looks like SRT
+        if "-->" not in clean_content:
+            # Fallback: Treat as plain text if structure failed
+            with open(txt_path, "w", encoding="utf-8") as f: f.write(clean_content)
+            with open(srt_path, "w", encoding="utf-8") as f: f.write(f"1\n00:00:00,000 --> 00:00:05,000\n{clean_content}")
+            return "Gemini (Text Mode)"
+            
+        with open(srt_path, "w", encoding="utf-8") as f: f.write(clean_content)
+        
+        # Extract Text from clean SRT for the .txt version
+        clean_text = re.sub(r'\d+\n\d{2}:\d{2}:\d{2},\d{3} --> \d{2}:\d{2}:\d{2},\d{3}\n', '', clean_content)
         clean_text = clean_text.replace('\n\n', ' ').strip()
         with open(txt_path, "w", encoding="utf-8") as f: f.write(clean_text)
         
@@ -136,184 +167,155 @@ def run_gemini_sync(audio_path, srt_path, txt_path):
         print(f"Gemini Error: {e}")
         return "Error"
 
-def format_timestamp(seconds):
+def format_timestamp(s):
     import math
-    h = math.floor(seconds / 3600); seconds %= 3600
-    m = math.floor(seconds / 60); seconds %= 60
-    return f"{h:02}:{m:02}:{math.floor(seconds):02},{round((seconds%1)*1000):03}"
+    h=math.floor(s/3600); s%=3600; m=math.floor(s/60); s%=60
+    return f"{h:02}:{m:02}:{math.floor(s):02},{round((s%1)*1000):03}"
 
-# --- 🌍 TRANSLATION ---
-# (Kept simple for brevity, same logic as before)
-async def translate_file(user_id, ext, prompt_key="burmese"):
+async def translate_file(user_id, ext):
     p = get_paths(user_id)
-    src = p['srt'] if ext == 'srt' else p['txt']
-    out = p['trans_srt'] if ext == 'srt' else p['trans_txt']
-    
+    src, out = (p['srt'], p['trans_srt']) if ext == 'srt' else (p['txt'], p['trans_txt'])
     if not os.path.exists(src): return False
     
-    # Simple logic: If SRT, we need pysrt. If TXT, direct prompt.
-    # For this snippet, I'll use the robust Pysrt method for SRTs
+    # YOUR CUSTOM TRANSLATION RULES
+    prompt = """
+    Role: Professional Burmese Video Narrator.
+    Task: Translate the input to Natural Burmese.
+    
+    Guidelines:
+    1. **Style:** Natural narrator flow. Not stiff.
+    2. **Forbidden:** NEVER use 'ပေါ့' (pout).
+    3. **Loan Words:** Write English abbreviations phonetically in Burmese (e.g. CIA -> စီအိုင်အေ).
+    4. **Format:** Keep strictly to the input format (SRT or Text).
+    """
+    
     try:
         if ext == 'srt':
             subs = pysrt.open(src, encoding='utf-8')
             texts = [s.text.replace('\n', ' ') for s in subs]
             block = "\n<SEP>\n".join(texts)
             
+            # Send batch to Gemini
             res = await asyncio.get_running_loop().run_in_executor(None, lambda: GENAI_CLIENT.models.generate_content(
-                model='gemini-2.0-flash',
-                contents=f"{DEFAULT_PROMPTS[prompt_key]}\n\nInput (Split by <SEP>):\n{block}"
+                model='gemini-2.0-flash', 
+                contents=f"{prompt}\n\nINSTRUCTIONS: Translate the following lines (separated by <SEP>). Return them separated by <SEP>.\n\nDATA:\n{block}"
             ))
             
-            trans_lines = res.text.strip().split("<SEP>")
+            lines = res.text.strip().split("<SEP>")
+            
+            # Fill back into SRT structure
             for i, s in enumerate(subs):
-                if i < len(trans_lines): s.text = trans_lines[i].strip()
+                if i < len(lines): 
+                    s.text = lines[i].strip()
             subs.save(out, encoding='utf-8')
         else:
             with open(src, 'r') as f: text = f.read()
             res = await asyncio.get_running_loop().run_in_executor(None, lambda: GENAI_CLIENT.models.generate_content(
-                model='gemini-2.0-flash', contents=f"{DEFAULT_PROMPTS[prompt_key]}\n\n{text}"
+                model='gemini-2.0-flash', contents=f"{prompt}\n\nInput Text:\n{text}"
             ))
             with open(out, 'w') as f: f.write(res.text)
-            
         return True
     except Exception as e:
+        print(f"Translation Error: {e}")
         return False
 
 # --- 🎮 HANDLERS ---
 
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("👋 **Video AI Studio**\nSend a video/audio to transcribe!\n\n/settings - Change Engine (Gemini/Whisper)")
+
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    prefs = get_user_prefs(user_id)
-    
-    # Engine Button Text
-    e_icon = "🧠" if prefs['engine'] == 'gemini' else "🎙️"
-    e_text = f"Engine: {prefs['engine'].title()} {e_icon}"
-    
-    # Format Button Text
-    f_text = f"Auto-Format: {prefs['format'].upper() if prefs['format'] != 'ask' else 'Ask Me'}"
-    
-    keyboard = [
-        [InlineKeyboardButton(e_text, callback_data="set_engine")],
-        [InlineKeyboardButton(f_text, callback_data="set_format")],
-        [InlineKeyboardButton("❌ Close", callback_data="close")]
-    ]
-    
-    await update.message.reply_text("⚙️ **Settings**", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text("⚙️ **Settings Menu**", reply_markup=get_settings_markup(user_id))
 
 async def process_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     user_id = msg.from_user.id
-    prefs = get_user_prefs(user_id)
+    prefs = get_prefs(user_id)
     p = get_paths(user_id)
     
     cleanup_files(user_id)
     status = await msg.reply_text("⏳ **Processing...**")
-    
-    # 1. Download
+
     if not await download_media(msg, p):
         await status.edit_text("❌ Download Failed.")
         return
 
-    # 2. Transcribe (Based on Engine Setting)
-    await status.edit_text(f"📝 **Transcribing with {prefs['engine'].title()}...**")
+    await status.edit_text(f"📝 **Transcribing ({prefs['engine']})...**")
     loop = asyncio.get_running_loop()
+    runner = run_gemini_sync if prefs['engine'] == "gemini" else run_whisper_sync
+    res_name = await loop.run_in_executor(None, runner, p['audio'], p['srt'], p['txt'])
     
-    if prefs['engine'] == "gemini":
-        eng_res = await loop.run_in_executor(None, run_gemini_sync, p['audio'], p['srt'], p['txt'])
-    else:
-        eng_res = await loop.run_in_executor(None, run_whisper_sync, p['audio'], p['srt'], p['txt'])
-        
-    if not os.path.exists(p['srt']):
-        await status.edit_text("❌ Transcription failed.")
-        return
-
-    # 3. Handle Output (Based on Format Setting)
     await status.delete()
-    
-    async def send_file(ext):
-        fpath = p['srt'] if ext == 'srt' else p['txt']
-        await context.bot.send_document(user_id, document=open(fpath, 'rb'), caption=f"✅ {ext.upper()} ({eng_res})")
-        
-    # Auto-Send logic
-    if prefs['format'] == 'srt':
-        await send_file('srt')
-        await show_translate_menu(update, context) # Optional: Offer translate after auto-send
-    elif prefs['format'] == 'txt':
-        await send_file('txt')
-        await show_translate_menu(update, context)
-    else:
-        # Ask User
-        keyboard = [
-            [InlineKeyboardButton("📄 TXT", callback_data="dl_txt"), InlineKeyboardButton("🎬 SRT", callback_data="dl_srt")],
-            [InlineKeyboardButton("🌍 Translate", callback_data="menu_trans")]
-        ]
-        await msg.reply_text(f"✅ **Done ({eng_res})**\nChoose format:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def show_translate_menu(update, context):
-    keyboard = [[InlineKeyboardButton("🌍 Translate File", callback_data="menu_trans")]]
-    await context.bot.send_message(update.effective_chat.id, "Need translation?", reply_markup=InlineKeyboardMarkup(keyboard))
+    async def send(ext):
+        f = p['srt'] if ext == 'srt' else p['txt']
+        if os.path.exists(f):
+            await context.bot.send_document(user_id, open(f, 'rb'), caption=f"✅ {ext.upper()} ({res_name})")
+
+    # Auto-Format Logic
+    if prefs['format'] == 'srt':
+        await send('srt')
+        await show_trans_menu(update, context)
+    elif prefs['format'] == 'txt':
+        await send('txt')
+        await show_trans_menu(update, context)
+    else:
+        # Ask User Logic
+        kb = [[InlineKeyboardButton("📄 TXT", callback_data="dl_txt"), InlineKeyboardButton("🎬 SRT", callback_data="dl_srt")],
+              [InlineKeyboardButton("🌍 Translate", callback_data="menu_trans")]]
+        await msg.reply_text(f"✅ **Done! Choose:**", reply_markup=InlineKeyboardMarkup(kb))
+
+async def show_trans_menu(update, context):
+    kb = [[InlineKeyboardButton("🌍 Translate File", callback_data="menu_trans")]]
+    await context.bot.send_message(update.effective_chat.id, "Need translation?", reply_markup=InlineKeyboardMarkup(kb))
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
-    prefs = get_user_prefs(user_id)
+    prefs = get_prefs(user_id)
     p = get_paths(user_id)
     data = query.data
-    
-    # --- SETTINGS TOGGLES ---
-    if data == "set_engine":
-        prefs['engine'] = "whisper" if prefs['engine'] == "gemini" else "gemini"
-        await settings_command(query, context) # Refresh menu
-        return
-        
-    if data == "set_format":
-        # Cycle: Ask -> SRT -> TXT -> Ask
-        modes = ["ask", "srt", "txt"]
-        curr_idx = modes.index(prefs['format'])
-        prefs['format'] = modes[(curr_idx + 1) % 3]
-        await settings_command(query, context)
+
+    # --- SETTINGS LOGIC ---
+    if data.startswith("set_"):
+        _, type, val = data.split("_")
+        if type == "eng": prefs['engine'] = val
+        if type == "fmt": prefs['format'] = val
+        try: await query.edit_message_reply_markup(reply_markup=get_settings_markup(user_id))
+        except: pass
         return
 
-    if data == "close":
+    if data == "close_settings":
         await query.message.delete()
         return
 
-    # --- FILE ACTIONS ---
-    if data == "dl_txt":
-        await context.bot.send_document(user_id, document=open(p['txt'], "rb"), caption="📄 Transcript")
-    elif data == "dl_srt":
-        await context.bot.send_document(user_id, document=open(p['srt'], "rb"), caption="🎬 Subtitles")
-        
-    # --- TRANSLATION ---
-    elif data == "menu_trans":
-        kb = [
-            [InlineKeyboardButton("🇲🇲 Burmese (.SRT)", callback_data="tr_bur_srt")],
-            [InlineKeyboardButton("🇲🇲 Burmese (.TXT)", callback_data="tr_bur_txt")]
-        ]
-        await query.message.edit_text("Select Format to Translate:", reply_markup=InlineKeyboardMarkup(kb))
-        
-    elif data.startswith("tr_"):
-        parts = data.split("_") # tr, bur, srt
-        ext = parts[2]
-        
-        await query.message.edit_text("⏳ **Translating...**")
-        success = await translate_file(user_id, ext)
-        
-        if success:
-            outfile = p['trans_srt'] if ext == 'srt' else p['trans_txt']
-            await context.bot.send_document(user_id, document=open(outfile, 'rb'), caption=f"✅ Translated {ext.upper()}")
+    # --- FILE LOGIC ---
+    if data == "dl_txt": await context.bot.send_document(user_id, open(p['txt'], "rb"), caption="📄 Transcript")
+    if data == "dl_srt": await context.bot.send_document(user_id, open(p['srt'], "rb"), caption="🎬 Subtitles")
+
+    # --- TRANSLATE LOGIC ---
+    if data == "menu_trans":
+        kb = [[InlineKeyboardButton("🇲🇲 Burmese (.SRT)", callback_data="tr_srt"),
+               InlineKeyboardButton("🇲🇲 Burmese (.TXT)", callback_data="tr_txt")]]
+        await query.message.edit_text("Select Format:", reply_markup=InlineKeyboardMarkup(kb))
+
+    if data.startswith("tr_"):
+        ext = data.split("_")[1]
+        await query.message.edit_text(f"⏳ **Translating {ext.upper()}...**")
+        if await translate_file(user_id, ext):
+            f = p['trans_srt'] if ext == 'srt' else p['trans_txt']
+            await context.bot.send_document(user_id, open(f, 'rb'), caption=f"✅ Translated {ext.upper()}")
             await query.message.delete()
         else:
             await query.message.edit_text("❌ Failed.")
 
-# --- 🚀 RUN ---
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TG_TOKEN).build()
-    app.add_handler(CommandHandler("start", lambda u,c: u.message.reply_text("👋 Send a file! Use /settings to configure.")))
+    app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(MessageHandler(filters.TEXT & filters.Entity("url"), process_media))
     app.add_handler(MessageHandler(filters.VIDEO | filters.AUDIO | filters.Document.ALL, process_media))
     app.add_handler(CallbackQueryHandler(callback_handler))
-    
     print("🚀 Bot Running...")
     app.run_polling()
