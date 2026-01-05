@@ -7,6 +7,7 @@ import torch
 import pysrt
 import math
 import shutil
+import re  # Added for SRT detection
 
 # Audio Processing
 from pydub import AudioSegment, effects
@@ -123,18 +124,14 @@ async def send_copyable_message(chat_id, bot, text):
         except Exception as e:
             print(f"Message Send Error: {e}")
 
-# --- 🔊 AUDIO POST-PROCESSING (Crisp & Sharp) ---
+# --- 🔊 AUDIO POST-PROCESSING ---
 def make_audio_crisp(audio_segment):
     """Applies filters to make voice sound sharper and clearer."""
-    # 1. High Pass Filter (Cuts muddy bass)
     clean_audio = audio_segment.high_pass_filter(200)
-    
-    # 2. Treble Boost (Simulated EQ)
     high_freqs = clean_audio.high_pass_filter(2000)
     crisp_audio = clean_audio.overlay(high_freqs - 2) 
-    
-    # 3. Normalize
-    return effects.normalize(crisp_audio)
+    final_audio = effects.normalize(crisp_audio)
+    return final_audio
 
 # --- 🎬 DUBBING ENGINE ---
 async def generate_dubbing(user_id, srt_path, output_path, voice):
@@ -175,9 +172,8 @@ async def generate_dubbing(user_id, srt_path, output_path, voice):
                 await communicate.save(temp_filename)
                 segment = AudioSegment.from_file(temp_filename)
 
-            # --- APPLY CRISP FILTER ---
+            # Apply Crisp Filter
             segment = make_audio_crisp(segment)
-            # --------------------------
 
             final_audio += segment
             current_timeline_ms += len(segment)
@@ -336,7 +332,7 @@ async def perform_dubbing(update, context):
     msg = update.effective_message
 
     if not os.path.exists(p['srt']):
-        await msg.reply_text("❌ **No SRT found.**\nPlease send an SRT file first.")
+        await msg.reply_text("❌ **No SRT found.**")
         return
 
     voice_name = next((k for k, v in VOICE_LIB.items() if v == state['dub_voice']), "Selected Voice")
@@ -446,11 +442,29 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = msg.text
     mode = user_modes.get(user_id)
     state = get_user_state(user_id)
-    
+    p = get_paths(user_id)
+
     if text.startswith("/cancel"):
         await cancel_command(update, context)
         return
 
+    # --- 1. SRT DETECTION (For Direct Pasting) ---
+    # Looks for simple timestamp format: 00:00:00,000 -->
+    if re.search(r'\d{2}:\d{2}:\d{2},\d{3} -->', text):
+        # Handle Split Messages:
+        # If it starts with "1" (newline or start of string), assume it's the beginning -> Overwrite
+        # Otherwise -> Append
+        file_mode = 'a'
+        if re.match(r'^\s*1\s*$', text.split('\n')[0].strip()) or text.strip().startswith('1\n'):
+            file_mode = 'w'
+        
+        with open(p['srt'], file_mode, encoding="utf-8") as f: f.write(text + "\n")
+        
+        keyboard = [[InlineKeyboardButton("🎬 Dub Audio", callback_data="trigger_dub")]]
+        await msg.reply_text("✅ **SRT Text Detected!**\nSaved. Want to dub?", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    # --- 2. Chat & Settings Modes ---
     if mode == "chat_gemini":
         await context.bot.send_chat_action(msg.chat_id, "typing")
         response = await run_chat_gemini(user_id, text)
@@ -476,17 +490,12 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if "http" in text:
         await process_media(update, context, is_url=True)
+        return
 
-    # --- UPDATED: HANDLE LONG MESSAGES (APPEND MODE) ---
+    # --- 3. Default Text Save ---
     if len(text) > 5:
-        p = get_paths(user_id)
-        # Use 'a' (append) so split messages are combined
-        with open(p['txt'], "a", encoding="utf-8") as f: 
-            f.write(text + "\n")
-        
-        # Check size for feedback
-        size = os.path.getsize(p['txt'])
-        await msg.reply_text(f"📝 **Text Appended!** (Total: {size} bytes)\nType `/translate` when done.")
+        with open(p['txt'], "w", encoding="utf-8") as f: f.write(text)
+        await msg.reply_text("✅ Text Saved. Type `/translate`.")
 
 async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -495,16 +504,11 @@ async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_obj = await (msg.document or msg.video or msg.audio).get_file()
     name = msg.document.file_name if msg.document else "vid.mp4"
     
-    # --- UPDATED: DIRECT SRT DUBBING PROMPT ---
     if name.lower().endswith('.srt'):
         await msg.reply_text("⬇️ **SRT Received.**")
         await file_obj.download_to_drive(p['srt'])
-        
         keyboard = [[InlineKeyboardButton("🎬 Dub Audio", callback_data="trigger_dub")]]
-        await msg.reply_text(
-            "✅ **SRT Loaded!**\nDo you want to generate dubbed audio now?", 
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+        await msg.reply_text("✅ **SRT Loaded.**", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     if name.lower().endswith('.txt'):
