@@ -9,6 +9,12 @@ import math
 import shutil
 import re 
 
+# User Data
+user_prefs = {}
+user_modes = {} 
+chat_histories = {}
+user_last_active = {} # 🕒 Last Active Time မှတ်ဖို့
+
 # Audio Processing
 from pydub import AudioSegment, effects
 from pydub.silence import detect_leading_silence # Added for trimming silence
@@ -251,10 +257,15 @@ def run_whisper(audio_path, srt_path, txt_path):
     print(f"🎙️ [Whisper] Processing...")
     try:
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        # Force float32 for CPU to avoid warnings/errors on some environments
-        compute_type = "float16" if device == "cuda" else "float32"
+        compute_type = "float16" if device == "cuda" else "int8"
+        
+        # Load Model
         model = WhisperModel("small", device=device, compute_type=compute_type)
-        segments, _ = model.transcribe(audio_path, beam_size=5)
+        
+        # 🚀 OPTIMIZATION HERE:
+        # beam_size=1: 5 ဆလောက် ပိုမြန်စေတယ် (Accuracy သိပ်မကျဘူး)
+        # vad_filter=True: စကားမပြောတဲ့ နေရာလွတ်တွေကို ကျော်ဖတ်မယ်
+        segments, _ = model.transcribe(audio_path, beam_size=1, vad_filter=True)
         
         with open(srt_path, "w", encoding="utf-8") as srt, open(txt_path, "w", encoding="utf-8") as txt:
             for i, segment in enumerate(segments, start=1):
@@ -263,7 +274,7 @@ def run_whisper(audio_path, srt_path, txt_path):
                 text = segment.text.strip()
                 srt.write(f"{i}\n{start} --> {end}\n{text}\n\n")
                 txt.write(f"{text} ")
-        return "Whisper (Local)"
+        return "Whisper (Fast)"
     except Exception as e:
         return f"Error: {e}"
 
@@ -318,12 +329,30 @@ async def run_translate(user_id, prompt_text):
     except Exception as e:
         return False, str(e), None
 
+# --- 🤖 CHAT GEMINI WITH AUTO-DELETE ---
 async def run_chat_gemini(user_id, text):
+    current_time = time.time()
+    ONE_DAY_SECONDS = 86400 # 24 Hours
+
+    # 1. Check & Auto Delete
+    # အရင်မှတ်ထားတဲ့ အချိန်ရှိပြီး၊ အဲဒီအချိန်က ၂၄ နာရီကျော်သွားပြီဆိုရင် History ကို ရှင်းမယ်
+    if user_id in user_last_active:
+        if current_time - user_last_active[user_id] > ONE_DAY_SECONDS:
+            chat_histories[user_id] = [] # Reset History
+            print(f"🧹 Auto-cleared history for {user_id} (Expired)")
+
+    # 2. Update Last Active Time
+    user_last_active[user_id] = current_time
+
+    # 3. Normal Chat Process
     if user_id not in chat_histories: chat_histories[user_id] = []
+    
     client = genai.Client(api_key=GEMINI_KEY)
     chat = client.chats.create(model='gemini-2.0-flash', history=chat_histories[user_id])
+    
     try:
         response = chat.send_message(text)
+        # History is managed by Gemini object/list automatically in this session
         return response.text
     except Exception as e:
         return f"Gemini Error: {e}"
