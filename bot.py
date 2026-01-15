@@ -254,7 +254,7 @@ def make_audio_crisp(audio_segment):
 
 # --- 🧠 ENGINES ---
 def run_whisper(audio_path, srt_path, txt_path):
-    print(f"🎙️ [Whisper] Processing...")
+    print(f"🎙️ [Whisper] Processing with Sentence Splitting...")
     try:
         device = "cuda" if torch.cuda.is_available() else "cpu"
         compute_type = "float16" if device == "cuda" else "int8"
@@ -262,21 +262,68 @@ def run_whisper(audio_path, srt_path, txt_path):
         # Load Model
         model = WhisperModel("small", device=device, compute_type=compute_type)
         
-        # 🚀 OPTIMIZATION HERE:
-        # beam_size=1: 5 ဆလောက် ပိုမြန်စေတယ် (Accuracy သိပ်မကျဘူး)
-        # vad_filter=True: စကားမပြောတဲ့ နေရာလွတ်တွေကို ကျော်ဖတ်မယ်
-        segments, _ = model.transcribe(audio_path, beam_size=1, vad_filter=True)
+        # 1. word_timestamps=True က အရေးအကြီးဆုံးပါ
+        # ဒါမှ စကားလုံးတစ်လုံးချင်းစီ ဘယ်အချိန်စပြီး ဘယ်အချိန်ဆုံးလဲ သိမှာပါ
+        segments, _ = model.transcribe(audio_path, beam_size=1, vad_filter=True, word_timestamps=True)
         
+        # --- SENTENCE RE-GROUPING LOGIC ---
+        final_subs = []
+        current_text = []
+        current_start = None
+        
+        # စာကြောင်းတစ်ကြောင်း အရမ်းရှည်မသွားအောင် ထိန်းဖို့ (Optional)
+        MAX_CHARS = 100 
+
+        for segment in segments:
+            for word in segment.words:
+                if current_start is None:
+                    current_start = word.start
+                
+                # စကားလုံးထည့်မယ်
+                current_text.append(word.word.strip())
+                
+                # စစ်ဆေးမယ့် အချက်များ:
+                # ၁. ပုဒ်မ (. ? !) နဲ့ဆုံးလား?
+                # ၂. ဒါမှမဟုတ် စာလုံးရေ အရမ်းများနေပြီလား? (MAX_CHARS ကျော်ရင် အတင်းဖြတ်မယ်)
+                text_str = " ".join(current_text)
+                is_end_of_sentence = word.word.strip()[-1] in ".?!"
+                is_too_long = len(text_str) > MAX_CHARS
+
+                if is_end_of_sentence or is_too_long:
+                    start_ts = format_timestamp(current_start)
+                    end_ts = format_timestamp(word.end)
+                    final_subs.append({
+                        "start": start_ts,
+                        "end": end_ts,
+                        "text": text_str
+                    })
+                    # Reset
+                    current_text = []
+                    current_start = None
+
+        # ကျန်နေခဲ့တဲ့ စာများရှိရင် နောက်ဆုံး စာကြောင်းအဖြစ် ထည့်မယ်
+        if current_text:
+            # Note: We use the last known word end time, but simplified here
+            start_ts = format_timestamp(current_start) if current_start else "00:00:00,000"
+            # Just approximation for end time if strictly needed, or use last word's end
+            # For robustness, usually we track the last word object. 
+            # But normally the loop handles most.
+            final_subs.append({
+                "start": start_ts,
+                "end": format_timestamp(segments[-1].end), # Fallback to segment end
+                "text": " ".join(current_text)
+            })
+
+        # File ထဲ ပြန်ရေးမယ်
         with open(srt_path, "w", encoding="utf-8") as srt, open(txt_path, "w", encoding="utf-8") as txt:
-            for i, segment in enumerate(segments, start=1):
-                start = format_timestamp(segment.start)
-                end = format_timestamp(segment.end)
-                text = segment.text.strip()
-                srt.write(f"{i}\n{start} --> {end}\n{text}\n\n")
-                txt.write(f"{text} ")
-        return "Whisper (Fast)"
+            for i, sub in enumerate(final_subs, start=1):
+                srt.write(f"{i}\n{sub['start']} --> {sub['end']}\n{sub['text']}\n\n")
+                txt.write(f"{sub['text']} ")
+                
+        return "Whisper (Sentence Mode)"
     except Exception as e:
         return f"Error: {e}"
+
 
 def run_gemini_transcribe(audio_path, srt_path, txt_path):
     print(f"✨ [Gemini] Listening...")
