@@ -148,78 +148,118 @@ def make_audio_crisp(audio_segment):
     final_audio = effects.normalize(crisp_audio)
     return final_audio
 
-# --- 🎬 DUBBING ENGINE (IMPROVED NATURAL FLOW) ---
+# --- 🎬 DUBBING ENGINE (SMOOTH FLOW & SMART SPEED) ---
 async def generate_dubbing(user_id, srt_path, output_path, voice):
-    """Generates audio with Natural Flow logic (ignoring small gaps)."""
+    """
+    Generates audio with smooth transitions.
+    Logic: 
+    1. If Audio > Time Slot -> Speed up to fit exactly (No rush, just fit).
+    2. If Audio < Time Slot -> Keep normal speed (No slow down).
+    3. Trim strict silences to avoid jerky stops.
+    """
     print(f"🎬 Starting Dubbing for {user_id} using {voice}...")
     try:
         subs = pysrt.open(srt_path)
         final_audio = AudioSegment.empty()
+        
+        # Track where the audio is currently at
         current_timeline_ms = 0
         
-        # Threshold: If gap is less than 500ms, ignore it (Natural Flow)
-        GAP_THRESHOLD_MS = 500 
+        # Reduce gap threshold (ignore gaps smaller than 200ms for smoother flow)
+        GAP_THRESHOLD = 200 
 
         for i, sub in enumerate(subs):
+            # Calculate Start/End in Milliseconds
             start_ms = (sub.start.hours * 3600 + sub.start.minutes * 60 + sub.start.seconds) * 1000 + sub.start.milliseconds
             end_ms = (sub.end.hours * 3600 + sub.end.minutes * 60 + sub.end.seconds) * 1000 + sub.end.milliseconds
+            
+            # The maximum time allowed for this sentence
             allowed_duration_ms = end_ms - start_ms
             
             text = sub.text.replace("\n", " ").strip()
             if not text: continue 
 
-            # --- 1. GAP HANDLING (SMART FLOW) ---
-            # Only add silence if the gap is LARGE (scene change). 
-            # If small gap, just connect the audio directly.
-            if start_ms > current_timeline_ms:
-                gap = start_ms - current_timeline_ms
-                if gap > GAP_THRESHOLD_MS:
-                    final_audio += AudioSegment.silent(duration=gap)
-                    current_timeline_ms += gap
-                # else: Ignore gap, let audio flow naturally
-            
-            # --- 2. TTS GENERATION ---
+            # --- 1. TTS GENERATION ---
             temp_filename = f"temp/{user_id}_chunk_{i}.mp3"
+            
+            # First, generate at normal speed
             communicate = edge_tts.Communicate(text, voice)
             await communicate.save(temp_filename)
             
             segment = AudioSegment.from_file(temp_filename)
             
-            # --- 3. TRIM SILENCE (Fixes Jerkiness) ---
-            # TTS often adds dead air at start/end. Remove it to connect sentences.
-            segment = trim_silence(segment)
-            segment = make_audio_crisp(segment)
+            # --- 2. TRIM SILENCE (Crucial for Smoothness) ---
+            # Remove dead air at start/end of the TTS file so sentences connect better
+            segment = trim_silence(segment, silence_thresh=-40.0, chunk_size=5)
 
-            # --- 4. SPEED ADJUSTMENT (GENTLE) ---
-            # Only speed up if it overflows significantly (> 15%)
-            # If it's just a little bit long, let it play naturally.
-            segment_len = len(segment)
-            ratio = segment_len / allowed_duration_ms
-
-            if ratio > 1.15: # Only if > 15% longer
-                # Calculate speed needed
-                percentage = int(ratio * 100 - 100 + 5) # +5 buffer
-                # Cap max speed to avoid robotic sound (max +50%)
-                if percentage > 50: percentage = 50
+            # --- 3. DURATION CHECK & RESAMPLE ---
+            current_len = len(segment)
+            
+            if current_len > allowed_duration_ms:
+                # CASE A: Audio is too long.
+                # Logic: Speed up ONLY enough to fit the box.
+                # Formula: (Current / Allowed) -> Percentage
+                ratio = current_len / allowed_duration_ms
+                percentage = int((ratio - 1) * 100) + 5 # +5% buffer to be safe
                 
-                speed_str = f"+{percentage}%" 
+                # Cap speed to prevent unintelligible gibberish (max +60%)
+                if percentage > 60: percentage = 60
+                
+                speed_str = f"+{percentage}%"
+                
+                # Re-generate with calculated speed
                 communicate = edge_tts.Communicate(text, voice, rate=speed_str)
                 await communicate.save(temp_filename)
                 
-                # Reload and re-trim
+                # Reload and Re-trim
                 segment = AudioSegment.from_file(temp_filename)
                 segment = trim_silence(segment)
-                segment = make_audio_crisp(segment)
+            
+            else:
+                # CASE B: Audio is shorter than time slot.
+                # Logic: User said "Don't speak slow". So we keep NORMAL speed.
+                # We do NOT stretch audio. 
+                pass
 
+            # --- 4. AUDIO CRISP FILTER ---
+            segment = make_audio_crisp(segment)
+
+            # --- 5. SYNC LOGIC (Natural Flow) ---
+            # If there is a gap between current audio end and next subtitle start:
+            if start_ms > current_timeline_ms:
+                gap = start_ms - current_timeline_ms
+                
+                # If gap is huge (scene change), add silence.
+                # If gap is small (conversation flow), IGNORE it to keep it smooth.
+                if gap > GAP_THRESHOLD:
+                    final_audio += AudioSegment.silent(duration=gap)
+                    current_timeline_ms += gap
+            
+            # Append the speech
             final_audio += segment
             current_timeline_ms += len(segment)
             
+            # Cleanup temp file
             if os.path.exists(temp_filename): os.remove(temp_filename)
 
+        # Export final
         final_audio.export(output_path, format="mp3")
         return True, None
+
     except Exception as e:
         return False, str(e)
+
+# Helper for trimming (Make sure this is in your code)
+def trim_silence(audio_segment, silence_thresh=-40.0, chunk_size=5):
+    if len(audio_segment) < 100: return audio_segment
+    start_trim = detect_leading_silence(audio_segment, silence_threshold=silence_thresh, chunk_size=chunk_size)
+    end_trim = detect_leading_silence(audio_segment.reverse(), silence_threshold=silence_thresh, chunk_size=chunk_size)
+    duration = len(audio_segment)
+    return audio_segment[start_trim:duration-end_trim]
+
+# Helper to detect silence (Required for trim_silence)
+from pydub.silence import detect_leading_silence
+
 
 # --- 🧠 ENGINES ---
 def run_whisper(audio_path, srt_path, txt_path):
