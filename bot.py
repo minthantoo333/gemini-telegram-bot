@@ -7,10 +7,11 @@ import torch
 import pysrt
 import math
 import shutil
-import re  # Added for SRT detection
+import re 
 
 # Audio Processing
 from pydub import AudioSegment, effects
+from pydub.silence import detect_leading_silence # Added for trimming silence
 import edge_tts
 
 # Telegram
@@ -55,6 +56,7 @@ BURMESE_STYLE = """
 Role: Professional Video Narrator (Burmese).
 Style: Natural, engaging, clear narration.
 No 'ပေါ့' (pout) at end of sentences.
+Translate naturally as a continuous story, not robotic word-by-word.
 """
 
 DEFAULT_PROMPTS = {
@@ -125,23 +127,39 @@ async def send_copyable_message(chat_id, bot, text):
             print(f"Message Send Error: {e}")
 
 # --- 🔊 AUDIO POST-PROCESSING ---
+def trim_silence(audio_segment, silence_thresh=-40.0, chunk_size=10):
+    """Trims silence from the beginning and end of an audio segment."""
+    if len(audio_segment) < 100:  # Skip if too short
+        return audio_segment
+        
+    start_trim = detect_leading_silence(audio_segment, silence_threshold=silence_thresh, chunk_size=chunk_size)
+    end_trim = detect_leading_silence(audio_segment.reverse(), silence_threshold=silence_thresh, chunk_size=chunk_size)
+    
+    duration = len(audio_segment)
+    trimmed = audio_segment[start_trim:duration-end_trim]
+    return trimmed
+
 def make_audio_crisp(audio_segment):
     """Applies filters to make voice sound sharper and clearer."""
     clean_audio = audio_segment.high_pass_filter(200)
     high_freqs = clean_audio.high_pass_filter(2000)
-    crisp_audio = clean_audio.overlay(high_freqs - 2) 
+    # Slightly reduced boost to prevent harshness
+    crisp_audio = clean_audio.overlay(high_freqs - 4) 
     final_audio = effects.normalize(crisp_audio)
     return final_audio
 
-# --- 🎬 DUBBING ENGINE ---
+# --- 🎬 DUBBING ENGINE (IMPROVED NATURAL FLOW) ---
 async def generate_dubbing(user_id, srt_path, output_path, voice):
-    """Generates audio synced to SRT timestamps with natural speed + Crisp Filter."""
+    """Generates audio with Natural Flow logic (ignoring small gaps)."""
     print(f"🎬 Starting Dubbing for {user_id} using {voice}...")
     try:
         subs = pysrt.open(srt_path)
         final_audio = AudioSegment.empty()
         current_timeline_ms = 0
         
+        # Threshold: If gap is less than 500ms, ignore it (Natural Flow)
+        GAP_THRESHOLD_MS = 500 
+
         for i, sub in enumerate(subs):
             start_ms = (sub.start.hours * 3600 + sub.start.minutes * 60 + sub.start.seconds) * 1000 + sub.start.milliseconds
             end_ms = (sub.end.hours * 3600 + sub.end.minutes * 60 + sub.end.seconds) * 1000 + sub.end.milliseconds
@@ -150,33 +168,52 @@ async def generate_dubbing(user_id, srt_path, output_path, voice):
             text = sub.text.replace("\n", " ").strip()
             if not text: continue 
 
-            # Gap Handling
+            # --- 1. GAP HANDLING (SMART FLOW) ---
+            # Only add silence if the gap is LARGE (scene change). 
+            # If small gap, just connect the audio directly.
             if start_ms > current_timeline_ms:
-                silence_gap = start_ms - current_timeline_ms
-                final_audio += AudioSegment.silent(duration=silence_gap)
-                current_timeline_ms += silence_gap
+                gap = start_ms - current_timeline_ms
+                if gap > GAP_THRESHOLD_MS:
+                    final_audio += AudioSegment.silent(duration=gap)
+                    current_timeline_ms += gap
+                # else: Ignore gap, let audio flow naturally
             
-            # TTS Generation
+            # --- 2. TTS GENERATION ---
             temp_filename = f"temp/{user_id}_chunk_{i}.mp3"
             communicate = edge_tts.Communicate(text, voice)
             await communicate.save(temp_filename)
             
             segment = AudioSegment.from_file(temp_filename)
             
-            # Speed Adjustment
-            if len(segment) > allowed_duration_ms:
-                ratio = len(segment) / allowed_duration_ms
-                percentage = int(ratio * 100 - 100 + 5)
+            # --- 3. TRIM SILENCE (Fixes Jerkiness) ---
+            # TTS often adds dead air at start/end. Remove it to connect sentences.
+            segment = trim_silence(segment)
+            segment = make_audio_crisp(segment)
+
+            # --- 4. SPEED ADJUSTMENT (GENTLE) ---
+            # Only speed up if it overflows significantly (> 15%)
+            # If it's just a little bit long, let it play naturally.
+            segment_len = len(segment)
+            ratio = segment_len / allowed_duration_ms
+
+            if ratio > 1.15: # Only if > 15% longer
+                # Calculate speed needed
+                percentage = int(ratio * 100 - 100 + 5) # +5 buffer
+                # Cap max speed to avoid robotic sound (max +50%)
+                if percentage > 50: percentage = 50
+                
                 speed_str = f"+{percentage}%" 
                 communicate = edge_tts.Communicate(text, voice, rate=speed_str)
                 await communicate.save(temp_filename)
+                
+                # Reload and re-trim
                 segment = AudioSegment.from_file(temp_filename)
-
-            # Apply Crisp Filter
-            segment = make_audio_crisp(segment)
+                segment = trim_silence(segment)
+                segment = make_audio_crisp(segment)
 
             final_audio += segment
             current_timeline_ms += len(segment)
+            
             if os.path.exists(temp_filename): os.remove(temp_filename)
 
         final_audio.export(output_path, format="mp3")
@@ -189,7 +226,8 @@ def run_whisper(audio_path, srt_path, txt_path):
     print(f"🎙️ [Whisper] Processing...")
     try:
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        compute_type = "float16" if device == "cuda" else "int8"
+        # Force float32 for CPU to avoid warnings/errors on some environments
+        compute_type = "float16" if device == "cuda" else "float32"
         model = WhisperModel("small", device=device, compute_type=compute_type)
         segments, _ = model.transcribe(audio_path, beam_size=5)
         
@@ -449,11 +487,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # --- 1. SRT DETECTION (For Direct Pasting) ---
-    # Looks for simple timestamp format: 00:00:00,000 -->
     if re.search(r'\d{2}:\d{2}:\d{2},\d{3} -->', text):
-        # Handle Split Messages:
-        # If it starts with "1" (newline or start of string), assume it's the beginning -> Overwrite
-        # Otherwise -> Append
         file_mode = 'a'
         if re.match(r'^\s*1\s*$', text.split('\n')[0].strip()) or text.strip().startswith('1\n'):
             file_mode = 'w'
