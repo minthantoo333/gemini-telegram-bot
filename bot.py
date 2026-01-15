@@ -148,63 +148,81 @@ def make_audio_crisp(audio_segment):
     final_audio = effects.normalize(crisp_audio)
     return final_audio
 
-# --- 🎬 DUBBING ENGINE (VOICERTOOL REPLICA STYLE) ---
+# --- 🎬 DUBBING ENGINE (HYBRID: NATURAL + SYNCED) ---
 async def generate_dubbing(user_id, srt_path, output_path, voice):
     """
-    Replica of Voicertool style:
-    1. Uses CONSTANT rate (e.g., +15%) for consistency. No jerky speed changes.
-    2. Slightly lowers pitch (-2Hz) for a warmer, more natural tone.
-    3. Trims silence but allows audio to flow naturally without strict timestamp cutoff.
+    Hybrid Approach:
+    1. Starts with Voicertool-like settings (+10% speed, -2Hz pitch).
+    2. CHECKS duration. If audio is too long, speeds it up GENTLY to fit.
+    3. Maintains sync by adding silence only when necessary (large gaps).
     """
-    print(f"🎬 Starting Dubbing (Voicertool Style) for {user_id}...")
+    print(f"🎬 Starting Dubbing (Synced + Natural) for {user_id}...")
     try:
         subs = pysrt.open(srt_path)
         final_audio = AudioSegment.empty()
         current_timeline_ms = 0
         
-        # --- VOICERTOOL SETTINGS ---
-        # Instead of calculating speed per line, we use a fixed comfortable speed.
-        # +10% to +15% is usually the "sweet spot" for Burmese TTS to sound natural.
-        FIXED_RATE = "+15%" 
-        FIXED_PITCH = "-2Hz" # Slightly deeper to sound less robotic
-        
+        # --- BASE SETTINGS ---
+        # Start with a comfortable speed that matches Voicertool
+        BASE_RATE_VAL = 10 # +10%
+        PITCH_VAL = "-2Hz"
+
         for i, sub in enumerate(subs):
             start_ms = (sub.start.hours * 3600 + sub.start.minutes * 60 + sub.start.seconds) * 1000 + sub.start.milliseconds
+            end_ms = (sub.end.hours * 3600 + sub.end.minutes * 60 + sub.end.seconds) * 1000 + sub.end.milliseconds
+            allowed_duration_ms = end_ms - start_ms
             
             text = sub.text.replace("\n", " ").strip()
             if not text: continue 
 
-            # --- 1. GENERATE AUDIO (Constant Speed) ---
+            # --- 1. SYNC CHECK (Wait for start time) ---
+            # If the previous audio finished EARLY, we must wait for this subtitle's start time.
+            # Otherwise, the audio will drift and happen too soon.
+            if start_ms > current_timeline_ms:
+                gap = start_ms - current_timeline_ms
+                # Only fill gap if it's significant (>100ms) to avoid micro-stutters
+                if gap > 100:
+                    final_audio += AudioSegment.silent(duration=gap)
+                    current_timeline_ms += gap
+
+            # --- 2. GENERATE (First Pass) ---
             temp_filename = f"temp/{user_id}_chunk_{i}.mp3"
             
-            # We apply the fixed rate/pitch globally here
-            communicate = edge_tts.Communicate(text, voice, rate=FIXED_RATE, pitch=FIXED_PITCH)
+            # Start with natural +10% speed
+            communicate = edge_tts.Communicate(text, voice, rate=f"+{BASE_RATE_VAL}%", pitch=PITCH_VAL)
             await communicate.save(temp_filename)
             
             segment = AudioSegment.from_file(temp_filename)
-            
-            # --- 2. GENTLE TRIMMING ---
-            # Remove only the absolute silence at edges to connect sentences
             segment = trim_silence(segment, silence_thresh=-40.0, chunk_size=5)
 
-            # --- 3. AUDIO FILTER (Warmth) ---
-            # Make it crisp but not too harsh
-            segment = make_audio_crisp(segment)
+            # --- 3. DURATION FIT (The Fix) ---
+            # Check if natural voice is too long for the timestamp
+            current_len = len(segment)
+            
+            if current_len > allowed_duration_ms:
+                # Calculate how much faster we need to be
+                ratio = current_len / allowed_duration_ms
+                
+                # Calculate new percentage needed (e.g., if ratio is 1.2, we need +20% MORE)
+                # We add this to our base rate of 10
+                extra_speed_needed = (ratio - 1) * 100
+                new_rate = int(BASE_RATE_VAL + extra_speed_needed + 5) # +5 buffer
+                
+                # CAP the speed so it doesn't sound crazy (Max +50%)
+                if new_rate > 50: new_rate = 50
+                
+                # Re-generate with faster speed
+                communicate = edge_tts.Communicate(text, voice, rate=f"+{new_rate}%", pitch=PITCH_VAL)
+                await communicate.save(temp_filename)
+                
+                # Load and Trim again
+                segment = AudioSegment.from_file(temp_filename)
+                segment = trim_silence(segment)
 
-            # --- 4. NATURAL PLACEMENT LOGIC ---
-            # If the subtitle starts LATER than our current audio position, add a small pause.
-            if start_ms > current_timeline_ms:
-                gap = start_ms - current_timeline_ms
-                # Voicertool logic: Only add silence if the gap is noticeable (>200ms)
-                # Otherwise, just flow directly into the next sentence.
-                if gap > 200: 
-                    final_audio += AudioSegment.silent(duration=gap)
-                    current_timeline_ms += gap
+            # --- 4. CRISP FILTER ---
+            segment = make_audio_crisp(segment)
             
-            # NOTE: If start_ms < current_timeline_ms (Overlapping), 
-            # we DO NOT speed up. We just append. This allows the voice to 
-            # finish the sentence naturally like a real human narrator.
-            
+            # --- 5. APPEND ---
             final_audio += segment
             current_timeline_ms += len(segment)
             
@@ -216,9 +234,8 @@ async def generate_dubbing(user_id, srt_path, output_path, voice):
     except Exception as e:
         return False, str(e)
 
-# --- Helper Functions (Make sure these are in your script) ---
+# --- Ensure these helpers are present ---
 def trim_silence(audio_segment, silence_thresh=-40.0, chunk_size=5):
-    """Trims digital silence from start/end."""
     if len(audio_segment) < 100: return audio_segment
     start_trim = detect_leading_silence(audio_segment, silence_threshold=silence_thresh, chunk_size=chunk_size)
     end_trim = detect_leading_silence(audio_segment.reverse(), silence_threshold=silence_thresh, chunk_size=chunk_size)
@@ -226,8 +243,6 @@ def trim_silence(audio_segment, silence_thresh=-40.0, chunk_size=5):
     return audio_segment[start_trim:duration-end_trim]
 
 def make_audio_crisp(audio_segment):
-    """Slight EQ to match Voicertool clarity."""
-    # High pass to remove rumble, slight boost to high freq
     clean = audio_segment.high_pass_filter(150)
     return effects.normalize(clean)
 
