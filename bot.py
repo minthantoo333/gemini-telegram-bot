@@ -33,10 +33,11 @@ if not TG_TOKEN or not GEMINI_KEY:
     print("❌ ERROR: API Keys are missing! Set TG_TOKEN and GEMINI_KEY in environment variables.")
     exit()
 
-# --- 🗣️ EXPANDED VOICE LIBRARY ---
+# --- 🗣️ VOICE LIBRARY (ALL PREVIOUS + NEW HIGH QUALITY) ---
 VOICE_LIB = {
     "🇲🇲 Thiha (Male)": "my-MM-ThihaNeural",
     "🇲🇲 Nular (Female)": "my-MM-NularNeural",
+    "🇺🇸 Remy (Multi)": "en-US-RemyMultilingualNeural",
     "🇺🇸 Andrew (Clean)": "en-US-AndrewNeural",
     "🇺🇸 Brian (Narrator)": "en-US-BrianNeural",
     "🇺🇸 Ava (Soft)": "en-US-AvaMultilingualNeural",
@@ -46,7 +47,7 @@ VOICE_LIB = {
     "🇮🇹 Giuseppe (Multi)": "it-IT-GiuseppeMultilingualNeural"
 }
 
-# --- 📝 PROMPTS ---
+# --- 📝 PROMPTS (OPTIMIZED FOR YOUR PREFERENCES) ---
 SRT_RULES = """
 **FORMATTING INSTRUCTIONS (STRICT):**
 1. The input is an **SRT Subtitle File**.
@@ -54,7 +55,8 @@ SRT_RULES = """
 3. **TIMESTAMPS:** Do NOT change, shift, or remove any timestamps. 
 4. **SEQUENCE NUMBERS:** Preserve exact sequence.
 5. **TRANSLATION:** Translate text to natural Burmese.
-6. **LOAN WORDS:** Phonetic spelling for English terms (e.g., CEO -> စီအီးအို).
+6. **TTS OPTIMIZATION:** - Write English loanwords phonetically in Burmese (e.g., CEO -> စီအီးအို).
+   - Adjust spelling for correct TTS pronunciation (e.g., write 'ငမန်း' instead of 'ငါးမန်း').
 """
 
 BURMESE_STYLE = """
@@ -148,7 +150,7 @@ def make_audio_crisp(audio_segment):
     crisp_audio = clean_audio.overlay(high_freqs - 4) 
     return effects.normalize(crisp_audio)
 
-# --- 🎬 DUBBING ENGINE ---
+# --- 🎬 DUBBING ENGINE (HYBRID: SYNC + NATURAL) ---
 async def generate_dubbing(user_id, srt_path, output_path, voice):
     print(f"🎬 Starting Dubbing for {user_id}...")
     try:
@@ -167,14 +169,14 @@ async def generate_dubbing(user_id, srt_path, output_path, voice):
             text = sub.text.replace("\n", " ").strip()
             if not text: continue 
 
-            # Sync Check
+            # Sync Check: Wait if we are early
             if start_ms > current_timeline_ms:
                 gap = start_ms - current_timeline_ms
                 if gap > 100:
                     final_audio += AudioSegment.silent(duration=gap)
                     current_timeline_ms += gap
 
-            # Generate
+            # Generate (First Pass)
             temp_filename = f"temp/{user_id}_chunk_{i}.mp3"
             communicate = edge_tts.Communicate(text, voice, rate=f"+{BASE_RATE_VAL}%", pitch=PITCH_VAL)
             await communicate.save(temp_filename)
@@ -182,7 +184,7 @@ async def generate_dubbing(user_id, srt_path, output_path, voice):
             segment = AudioSegment.from_file(temp_filename)
             segment = trim_silence(segment)
 
-            # Duration Fit
+            # Duration Check: Speed up only if too long
             if len(segment) > allowed_duration_ms:
                 ratio = len(segment) / allowed_duration_ms
                 extra_speed = (ratio - 1) * 100
