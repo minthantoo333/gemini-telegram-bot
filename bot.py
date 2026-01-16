@@ -10,7 +10,7 @@ import shutil
 import re
 import time
 import random
-import requests # ✅ Added for Gemini API Call
+import base64
 
 # User Data Storage
 user_prefs = {}
@@ -41,28 +41,20 @@ if not TG_TOKEN or not GEMINI_KEY:
     exit()
 
 # --- 🗣️ VOICE LIBRARY ---
-# STANDARD: Works for SRT Dubbing & Text (Edge TTS)
-# GEMINI: Works for Text Only (Google API)
 VOICE_LIB = {
-    # --- Standard (SRT Supported) ---
+    # --- Standard (SRT + Text) ---
     "🇲🇲 Burmese (Thiha)": "my-MM-ThihaNeural",
     "🇲🇲 Burmese (Nilar)": "my-MM-NularNeural",
     "🇺🇸 Chris (Recap)": "en-US-ChristopherNeural", 
     "🇺🇸 Eric (Energetic)": "en-US-EricNeural",
-    "🇺🇸 Brian (Classic)": "en-US-BrianNeural",
-    "🇬🇧 Ryan (British)": "en-GB-RyanNeural",
     
-    # --- Gemini (Text Only - No SRT) ---
-    # These map to the "Voice" param in Google's API
-    "✨ Gemini Alloy": "alloy",
-    "✨ Gemini Echo": "echo",
-    "✨ Gemini Shimmer": "shimmer",
-    "✨ Gemini Puck": "Puck",
-    "✨ Gemini Zephyr": "Zephyr",
-    "✨ Gemini Aoede": "Aoede",
-    "✨ Gemini Charon": "Charon",
-    "✨ Gemini Fenrir": "Fenrir",
-    "✨ Gemini Kore": "Kore"
+    # --- Gemini (Text Only) ---
+    # Using the specific names from your snippet
+    "✨ Gemini Puck (M)": "Puck",
+    "✨ Gemini Charon (M)": "Charon",
+    "✨ Gemini Fenrir (M)": "Fenrir",
+    "✨ Gemini Kore (F)": "Kore",
+    "✨ Gemini Zephyr (F)": "Zephyr"
 }
 
 # --- 📝 PROMPTS ---
@@ -120,13 +112,11 @@ def get_paths(user_id):
     }
 
 def clean_temp(user_id):
-    # Deletes only temp chunks
     for f in glob.glob(f"temp/{user_id}_chunk_*.mp3"):
         try: os.remove(f)
         except: pass
 
 def cleanup_old_files():
-    """Deletes files older than 24 hours"""
     now = time.time()
     cutoff = 86400 # 24 Hours
     print("🧹 Running Auto Cleanup...")
@@ -169,35 +159,46 @@ def make_audio_crisp(audio_segment):
     high_freqs = clean.high_pass_filter(2000)
     return effects.normalize(clean.overlay(high_freqs - 4))
 
-# --- 🗣️ REAL GEMINI TTS FUNCTION ---
+# --- 🗣️ REAL GEMINI TTS FUNCTION (NATIVE SDK) ---
 async def generate_gemini_tts(text, voice_id, output_path):
     """
-    Calls Google's OpenAI-Compatible Speech Endpoint.
-    Works with Free Tier API Keys in supported regions.
+    Uses the Google GenAI SDK with the specific 'speech_config' 
+    structure you provided in your TypeScript snippet.
     """
-    url = "https://generativelanguage.googleapis.com/v1beta/openai/audio/speech"
-    headers = {
-        "Authorization": f"Bearer {GEMINI_KEY}",
-        "Content-Type": "application/json"
-    }
-    data = {
-        "model": "tts-1", # Standard model name for compatibility
-        "input": text,
-        "voice": voice_id # Puck, Zephyr, Alloy, etc.
-    }
-    
     try:
-        # We run the blocking request in a separate thread to not freeze the bot
-        loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(None, lambda: requests.post(url, headers=headers, json=data))
+        client = genai.Client(api_key=GEMINI_KEY)
         
-        if response.status_code == 200:
+        # We use gemini-2.0-flash as it supports Audio Generation
+        response = client.models.generate_content(
+            model='gemini-2.0-flash', 
+            contents=text,
+            config=types.GenerateContentConfig(
+                response_modalities=["AUDIO"],
+                speech_config=types.SpeechConfig(
+                    voice_config=types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                            voice_name=voice_id
+                        )
+                    )
+                )
+            )
+        )
+        
+        # Extract Audio Data (The SDK returns bytes in inline_data)
+        # We look for the part that contains inline_data
+        audio_bytes = None
+        for part in response.candidates[0].content.parts:
+            if part.inline_data:
+                audio_bytes = part.inline_data.data
+                break
+        
+        if audio_bytes:
             with open(output_path, "wb") as f:
-                f.write(response.content)
+                f.write(audio_bytes)
             return True, output_path
         else:
-            return False, f"API Error {response.status_code}: {response.text}"
-            
+            return False, "No audio data received from Gemini."
+
     except Exception as e:
         return False, str(e)
 
@@ -205,10 +206,10 @@ async def generate_gemini_tts(text, voice_id, output_path):
 async def generate_voice_sample(user_id, voice_code):
     p = get_paths(user_id)
     
-    # 1. Gemini Voice
-    # Now we use the REAL function!
-    if voice_code in ["Puck", "Zephyr", "Aoede", "Charon", "Fenrir", "Kore", "alloy", "echo", "shimmer"]:
-        text = "Hello! This is a sample of my AI voice."
+    # 1. Gemini Voice Check
+    gemini_voices = ["Puck", "Zephyr", "Aoede", "Charon", "Fenrir", "Kore"]
+    if voice_code in gemini_voices:
+        text = "Hello! This is a sample of my voice. I am ready to help you."
         return await generate_gemini_tts(text, voice_code, p['sample'])
 
     # 2. Edge TTS (Standard)
@@ -224,11 +225,10 @@ async def generate_voice_sample(user_id, voice_code):
 
 # --- 🎬 DUBBING ENGINE (SRT) ---
 async def generate_dubbing(user_id, srt_path, output_path, voice):
-    # ⛔ Block Gemini Voices for SRT (Timestamp syncing not supported yet)
-    # Check if voice is in our Gemini list
-    gemini_voices = ["Puck", "Zephyr", "Aoede", "Charon", "Fenrir", "Kore", "alloy", "echo", "shimmer"]
+    # ⛔ Block Gemini Voices for SRT
+    gemini_voices = ["Puck", "Zephyr", "Aoede", "Charon", "Fenrir", "Kore"]
     if voice in gemini_voices:
-        return False, "⛔ Gemini voices are for **Text Only**.\nThey cannot be used for SRT Dubbing.\nPlease select a Standard voice (e.g., Thiha, Chris)."
+        return False, "⛔ Gemini voices are for **Text Only**.\nThey do not support timestamped dubbing.\nPlease use a Standard voice."
 
     print(f"🎬 Starting Dubbing for {user_id}...")
     try:
@@ -236,7 +236,6 @@ async def generate_dubbing(user_id, srt_path, output_path, voice):
         final_audio = AudioSegment.empty()
         current_timeline_ms = 0
         
-        # Base Settings
         BASE_RATE = 10 
         PITCH = "-2Hz"
 
@@ -248,14 +247,12 @@ async def generate_dubbing(user_id, srt_path, output_path, voice):
             text = sub.text.replace("\n", " ").strip()
             if not text: continue 
 
-            # Sync Gap
             if start_ms > current_timeline_ms:
                 gap = start_ms - current_timeline_ms
                 if gap > 100:
                     final_audio += AudioSegment.silent(duration=gap)
                     current_timeline_ms += gap
 
-            # Generate Chunk
             temp_filename = f"temp/{user_id}_chunk_{i}.mp3"
             communicate = edge_tts.Communicate(text, voice, rate=f"+{BASE_RATE}%", pitch=PITCH)
             await communicate.save(temp_filename)
@@ -263,13 +260,11 @@ async def generate_dubbing(user_id, srt_path, output_path, voice):
             segment = AudioSegment.from_file(temp_filename)
             segment = trim_silence(segment)
             
-            # Duration Fix (Speed up if too long)
             if len(segment) > allowed_dur:
                 ratio = len(segment) / allowed_dur
                 extra_speed = (ratio - 1) * 100
                 new_rate = int(BASE_RATE + extra_speed + 5)
                 if new_rate > 50: new_rate = 50
-                
                 communicate = edge_tts.Communicate(text, voice, rate=f"+{new_rate}%", pitch=PITCH)
                 await communicate.save(temp_filename)
                 segment = AudioSegment.from_file(temp_filename)
@@ -278,7 +273,6 @@ async def generate_dubbing(user_id, srt_path, output_path, voice):
             segment = make_audio_crisp(segment)
             final_audio += segment
             current_timeline_ms += len(segment)
-            
             if os.path.exists(temp_filename): os.remove(temp_filename)
 
         final_audio.export(output_path, format="mp3")
@@ -287,7 +281,7 @@ async def generate_dubbing(user_id, srt_path, output_path, voice):
     except Exception as e:
         return False, str(e)
 
-# --- 🧠 ENGINES (Transcribe/Translate) ---
+# --- 🧠 ENGINES ---
 def run_whisper(audio_path, srt_path, txt_path):
     try:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -318,7 +312,7 @@ def run_gemini_transcribe(audio_path, srt_path, txt_path):
             contents=[types.Content(parts=[types.Part.from_bytes(data=audio_bytes, mime_type="audio/mp3"), types.Part.from_text(text="Transcribe exactly.")])]
         )
         with open(txt_path, "w", encoding="utf-8") as f: f.write(response.text.strip())
-        if os.path.exists(srt_path): os.remove(srt_path) # No SRT for Gemini Flash audio
+        if os.path.exists(srt_path): os.remove(srt_path)
         return "Gemini Flash"
     except: return "Error"
 
@@ -395,7 +389,6 @@ async def voices_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = []
     row = []
     for name, code in VOICE_LIB.items():
-        # Labeling
         label = name.split("(")[0].strip() + (" (Gemini)" if "Gemini" in name else "")
         row.append(InlineKeyboardButton(label, callback_data=f"set_voice_{code}"))
         if len(row) == 2:
@@ -434,10 +427,9 @@ async def perform_dubbing(update, context):
         await msg.reply_text("❌ No SRT found.")
         return
 
-    # Check Compatibility
-    gemini_voices = ["Puck", "Zephyr", "Aoede", "Charon", "Fenrir", "Kore", "alloy", "echo", "shimmer"]
+    gemini_voices = ["Puck", "Zephyr", "Aoede", "Charon", "Fenrir", "Kore"]
     if state['dub_voice'] in gemini_voices:
-        await msg.reply_text("⛔ **Gemini Voice Error**\nGemini voices do not support SRT Dubbing.\nPlease switch to a Standard voice (e.g., Thiha, Chris).")
+        await msg.reply_text("⛔ **Gemini Voice Error**\nGemini voices do not support SRT Dubbing.\nPlease switch to a Standard voice.")
         return
 
     voice_name = next((k for k, v in VOICE_LIB.items() if v == state['dub_voice']), "Voice")
@@ -501,7 +493,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         v_name = next((k for k, v in VOICE_LIB.items() if v == new_voice), "Voice")
         
         # Check compatibility
-        gemini_voices = ["Puck", "Zephyr", "Aoede", "Charon", "Fenrir", "Kore", "alloy", "echo", "shimmer"]
+        gemini_voices = ["Puck", "Zephyr", "Aoede", "Charon", "Fenrir", "Kore"]
         if new_voice in gemini_voices:
             await query.answer(f"Selected: {v_name} (Text Only)")
             await query.message.edit_text(f"✅ **{v_name}** selected.\n(Use with Text only, not SRT)")
@@ -509,7 +501,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer(f"Selected: {v_name}")
             await query.message.edit_text(f"⏳ **Generating Sample for {v_name}...**")
             
-        # Attempt to generate sample (now works for Gemini too!)
         success, sample_path = await generate_voice_sample(user_id, new_voice)
         if success:
             await context.bot.send_voice(chat_id=query.message.chat_id, voice=open(sample_path, "rb"), caption=f"🗣️ Sample: {v_name}")
@@ -607,7 +598,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 3. TEXT-TO-SPEECH (TTS)
     if len(text) < 2000:
-        gemini_voices = ["Puck", "Zephyr", "Aoede", "Charon", "Fenrir", "Kore", "alloy", "echo", "shimmer"]
+        gemini_voices = ["Puck", "Zephyr", "Aoede", "Charon", "Fenrir", "Kore"]
         
         # GEMINI TTS LOGIC
         if state['dub_voice'] in gemini_voices:
@@ -618,7 +609,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await status.delete()
                 await context.bot.send_voice(chat_id=msg.chat_id, voice=open(path, "rb"))
             else:
-                await status.edit_text(f"❌ Error: {path}") # path contains error message here
+                await status.edit_text(f"❌ Error: {path}") 
             return
 
         # EDGE TTS (Standard)
