@@ -33,10 +33,10 @@ if not TG_TOKEN or not GEMINI_KEY:
     print("❌ ERROR: API Keys are missing! Set TG_TOKEN and GEMINI_KEY in environment variables.")
     exit()
 
-# --- 🗣️ VOICE LIBRARY (ALL PREVIOUS + NEW HIGH QUALITY) ---
+# --- 🗣️ VOICE LIBRARY ---
 VOICE_LIB = {
     "🇲🇲 Thiha (Male)": "my-MM-ThihaNeural",
-    "🇲🇲 Nular (Female)": "my-MM-NularNeural",
+    "🇲🇲 Nilar (Female)": "my-MM-NilarNeural",
     "🇺🇸 Remy (Multi)": "en-US-RemyMultilingualNeural",
     "🇺🇸 Andrew (Clean)": "en-US-AndrewNeural",
     "🇺🇸 Brian (Narrator)": "en-US-BrianNeural",
@@ -47,7 +47,7 @@ VOICE_LIB = {
     "🇮🇹 Giuseppe (Multi)": "it-IT-GiuseppeMultilingualNeural"
 }
 
-# --- 📝 PROMPTS (OPTIMIZED FOR YOUR PREFERENCES) ---
+# --- 📝 PROMPTS ---
 SRT_RULES = """
 **FORMATTING INSTRUCTIONS (STRICT):**
 1. The input is an **SRT Subtitle File**.
@@ -150,7 +150,7 @@ def make_audio_crisp(audio_segment):
     crisp_audio = clean_audio.overlay(high_freqs - 4) 
     return effects.normalize(crisp_audio)
 
-# --- 🎬 DUBBING ENGINE (HYBRID: SYNC + NATURAL) ---
+# --- 🎬 DUBBING ENGINE ---
 async def generate_dubbing(user_id, srt_path, output_path, voice):
     print(f"🎬 Starting Dubbing for {user_id}...")
     try:
@@ -169,14 +169,12 @@ async def generate_dubbing(user_id, srt_path, output_path, voice):
             text = sub.text.replace("\n", " ").strip()
             if not text: continue 
 
-            # Sync Check: Wait if we are early
             if start_ms > current_timeline_ms:
                 gap = start_ms - current_timeline_ms
                 if gap > 100:
                     final_audio += AudioSegment.silent(duration=gap)
                     current_timeline_ms += gap
 
-            # Generate (First Pass)
             temp_filename = f"temp/{user_id}_chunk_{i}.mp3"
             communicate = edge_tts.Communicate(text, voice, rate=f"+{BASE_RATE_VAL}%", pitch=PITCH_VAL)
             await communicate.save(temp_filename)
@@ -184,7 +182,6 @@ async def generate_dubbing(user_id, srt_path, output_path, voice):
             segment = AudioSegment.from_file(temp_filename)
             segment = trim_silence(segment)
 
-            # Duration Check: Speed up only if too long
             if len(segment) > allowed_duration_ms:
                 ratio = len(segment) / allowed_duration_ms
                 extra_speed = (ratio - 1) * 100
@@ -207,50 +204,71 @@ async def generate_dubbing(user_id, srt_path, output_path, voice):
     except Exception as e:
         return False, str(e)
 
-# --- 🧠 AI ENGINES ---
+# --- 🧠 AI ENGINES (UPDATED: SMART SEGMENTATION) ---
+def format_timestamp(seconds):
+    hours = math.floor(seconds / 3600)
+    seconds %= 3600
+    minutes = math.floor(seconds / 60)
+    seconds %= 60
+    milliseconds = round((seconds - math.floor(seconds)) * 1000)
+    return f"{hours:02}:{minutes:02}:{math.floor(seconds):02},{milliseconds:03}"
+
 def run_whisper(audio_path, srt_path, txt_path):
-    print(f"🎙️ [Whisper] Processing...")
+    print(f"🎙️ [Whisper] Processing with Smart Clauses...")
     try:
         device = "cuda" if torch.cuda.is_available() else "cpu"
         compute_type = "float16" if device == "cuda" else "int8"
         model = WhisperModel("small", device=device, compute_type=compute_type)
-        segments, _ = model.transcribe(audio_path, beam_size=1, vad_filter=True, word_timestamps=True)
+        segments, _ = model.transcribe(audio_path, beam_size=5, vad_filter=True, word_timestamps=True)
         
         final_subs = []
-        current_text = []
+        current_segment_words = []
         current_start = None
-        MAX_CHARS = 100 
-
+        
+        # Settings for "GetSubs" style
+        MAX_CHARS_PER_BLOCK = 80
+        all_words = []
         for segment in segments:
-            for word in segment.words:
-                if current_start is None: current_start = word.start
-                current_text.append(word.word.strip())
-                
-                text_str = " ".join(current_text)
-                is_end = word.word.strip()[-1] in ".?!"
-                is_long = len(text_str) > MAX_CHARS
+            all_words.extend(segment.words)
 
-                if is_end or is_long:
-                    final_subs.append({
-                        "start": format_timestamp(current_start),
-                        "end": format_timestamp(word.end),
-                        "text": text_str
-                    })
-                    current_text = []
-                    current_start = None
+        for i, word in enumerate(all_words):
+            if current_start is None: current_start = word.start
+            current_segment_words.append(word)
+            
+            # Text check
+            text_str = " ".join([w.word.strip() for w in current_segment_words])
+            clean_word = word.word.strip()
+            
+            # 1. End of Sentence (.?!)
+            is_sentence_end = clean_word[-1] in ".?!" if clean_word else False
+            # 2. Clause break (Comma + Length)
+            is_clause_end = (clean_word[-1] == ",") and (len(text_str) > 20)
+            # 3. Too long
+            is_too_long = len(text_str) > MAX_CHARS_PER_BLOCK
 
-        if current_text:
+            if is_sentence_end or is_clause_end or is_too_long:
+                start_ts = format_timestamp(current_start)
+                end_ts = format_timestamp(word.end)
+                final_subs.append({
+                    "start": start_ts,
+                    "end": end_ts,
+                    "text": text_str
+                })
+                current_segment_words = []
+                current_start = None
+
+        if current_segment_words:
+            start_ts = format_timestamp(current_start)
+            end_ts = format_timestamp(all_words[-1].end)
             final_subs.append({
-                "start": format_timestamp(current_start),
-                "end": format_timestamp(segments[-1].end),
-                "text": " ".join(current_text)
+                "start": start_ts, "end": end_ts, "text": " ".join([w.word.strip() for w in current_segment_words])
             })
 
         with open(srt_path, "w", encoding="utf-8") as srt, open(txt_path, "w", encoding="utf-8") as txt:
             for i, sub in enumerate(final_subs, start=1):
                 srt.write(f"{i}\n{sub['start']} --> {sub['end']}\n{sub['text']}\n\n")
                 txt.write(f"{sub['text']} ")
-        return "Whisper"
+        return "Whisper (Smart)"
     except Exception as e:
         return f"Error: {e}"
 
@@ -268,14 +286,6 @@ def run_gemini_transcribe(audio_path, srt_path, txt_path):
         return "Gemini Flash"
     except Exception as e:
         return "Error"
-
-def format_timestamp(seconds):
-    hours = math.floor(seconds / 3600)
-    seconds %= 3600
-    minutes = math.floor(seconds / 60)
-    seconds %= 60
-    milliseconds = round((seconds - math.floor(seconds)) * 1000)
-    return f"{hours:02}:{minutes:02}:{math.floor(seconds):02},{milliseconds:03}"
 
 async def run_translate(user_id, prompt_text):
     p = get_paths(user_id)
@@ -332,8 +342,6 @@ async def post_init(application):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     state = get_user_state(user_id)
-    
-    # Dashboard UI
     v_name = next((k for k, v in VOICE_LIB.items() if v == state['dub_voice']), "Unknown")
     
     text = (
@@ -412,7 +420,6 @@ async def perform_translation(update, context, user_id, prompt):
     else:
         await status.edit_text("❌ Translation Error.")
 
-# --- 🎮 INTERACTION HANDLER ---
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
@@ -459,7 +466,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_voice(chat_id=query.message.chat_id, voice=open(sample_path, "rb"), caption=f"🎙️ **{v_name}**")
         except:
             await context.bot.send_message(chat_id=query.message.chat_id, text="❌ Could not generate sample.")
-        # -------------------------------
 
     elif data == "menu_settings":
         await settings_command(update, context)
@@ -560,7 +566,7 @@ async def process_media(update, context, is_url):
         if state['transcribe_engine'] == "whisper":
             await loop.run_in_executor(None, run_whisper, p['audio'], p['srt'], p['txt'])
             if os.path.exists(p['srt']):
-                await context.bot.send_document(msg.chat_id, open(p['srt'], "rb"), caption="🎬 **SRT Generated**")
+                await context.bot.send_document(msg.chat_id, open(p['srt'], "rb"), caption="🎬 **SRT Generated (Smart Clause)**")
         else:
             await loop.run_in_executor(None, run_gemini_transcribe, p['audio'], p['srt'], p['txt'])
             if os.path.exists(p['txt']):
