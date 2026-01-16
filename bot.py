@@ -11,6 +11,7 @@ import re
 import time
 
 # --- 📦 LIBRARIES ---
+# Audio Processing
 from pydub import AudioSegment, effects
 from pydub.silence import detect_leading_silence
 import edge_tts
@@ -28,18 +29,15 @@ from faster_whisper import WhisperModel
 TG_TOKEN = os.getenv("TG_TOKEN")
 GEMINI_KEY = os.getenv("GEMINI_KEY")
 
-# Setup Logging
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-
 if not TG_TOKEN or not GEMINI_KEY:
-    print("❌ ERROR: API Keys are missing! Set TG_TOKEN and GEMINI_KEY.")
+    print("❌ ERROR: API Keys are missing! Set TG_TOKEN and GEMINI_KEY in environment variables.")
     exit()
 
 # --- 🗣️ VOICE LIBRARY ---
 VOICE_LIB = {
     "🇲🇲 Thiha (Male)": "my-MM-ThihaNeural",
-    "🇲🇲 Nilar (Female)": "my-MM-NilarNeural",
-    "🇺🇸 Remy (Multi)": "fr-FR-RemyMultilingualNeural",
+    "🇲🇲 Nular (Female)": "my-MM-NularNeural",
+    "🇺🇸 Remy (Multi)": "en-US-RemyMultilingualNeural",
     "🇺🇸 Andrew (Clean)": "en-US-AndrewNeural",
     "🇺🇸 Brian (Narrator)": "en-US-BrianNeural",
     "🇺🇸 Ava (Soft)": "en-US-AvaMultilingualNeural",
@@ -99,20 +97,18 @@ def get_active_prompt(user_id, key):
     return custom if custom else DEFAULT_PROMPTS[key]
 
 def get_paths(user_id):
-    # Added .srt suffix logic later, standardizing here
     return {
         "input": f"downloads/{user_id}_input.mp4",
         "audio": f"downloads/{user_id}_audio.mp3",
         "srt": f"downloads/{user_id}_subs.srt",
         "txt": f"downloads/{user_id}_transcript.txt",
-        "trans_result": f"downloads/{user_id}_translated", 
+        "trans_result": f"downloads/{user_id}_translated",
         "dub_audio": f"downloads/{user_id}_dubbed.mp3"
     }
 
 def clean_temp(user_id):
     p = get_paths(user_id)
     if os.path.exists(p['input']): os.remove(p['input'])
-    # Safer glob pattern to avoid deleting other users' files
     for f in glob.glob(f"temp/{user_id}_chunk_*.mp3"):
         try: os.remove(f)
         except: pass
@@ -136,36 +132,42 @@ async def send_copyable_message(chat_id, bot, text):
     for i in range(0, len(safe_text), MAX_LEN):
         chunk = safe_text[i:i+MAX_LEN]
         try:
-            # Force markdown block closure to prevent formatting breaks
             await bot.send_message(chat_id=chat_id, text=f"```\n{chunk}\n```", parse_mode='Markdown')
         except Exception as e:
             print(f"Message Send Error: {e}")
 
-# --- 🔊 AUDIO PROCESSING ---
+# --- 🔊 AUDIO PROCESSING (PRO VERSION) ---
 def trim_silence(audio_segment, silence_thresh=-40.0, chunk_size=5):
     if len(audio_segment) < 100: return audio_segment
-    # Only trim start to keep flow natural, or trim both but carefully
     start_trim = detect_leading_silence(audio_segment, silence_threshold=silence_thresh, chunk_size=chunk_size)
     end_trim = detect_leading_silence(audio_segment.reverse(), silence_threshold=silence_thresh, chunk_size=chunk_size)
     duration = len(audio_segment)
     return audio_segment[start_trim:duration-end_trim]
 
 def make_audio_crisp(audio_segment):
+    """High Quality Filter (Better than basic high_pass)"""
     clean_audio = audio_segment.high_pass_filter(200)
     high_freqs = clean_audio.high_pass_filter(2000)
     crisp_audio = clean_audio.overlay(high_freqs - 4) 
     return effects.normalize(crisp_audio)
 
-# --- 🎬 DUBBING ENGINE (OPTIMIZED) ---
+# --- 🎬 DUBBING ENGINE (YOUR PREFERRED HYBRID LOGIC) ---
 async def generate_dubbing(user_id, srt_path, output_path, voice):
-    print(f"🎬 Starting Dubbing for {user_id}...")
+    """
+    Hybrid Approach:
+    1. Starts with Voicertool-like settings (+10% speed, -2Hz pitch).
+    2. CHECKS duration. If audio is too long, speeds it up GENTLY to fit.
+    3. Maintains sync by adding silence only when necessary (large gaps).
+    """
+    print(f"🎬 Starting Dubbing (Synced + Natural) for {user_id}...")
     try:
         subs = pysrt.open(srt_path)
-        # OPTIMIZATION: Use a list instead of += AudioSegment
-        audio_segments = []
+        final_audio = AudioSegment.empty()
         current_timeline_ms = 0
         
-        BASE_RATE_VAL = 10 
+        # --- BASE SETTINGS ---
+        # Start with a comfortable speed that matches Voicertool
+        BASE_RATE_VAL = 10 # +10%
         PITCH_VAL = "-2Hz"
 
         for i, sub in enumerate(subs):
@@ -176,50 +178,59 @@ async def generate_dubbing(user_id, srt_path, output_path, voice):
             text = sub.text.replace("\n", " ").strip()
             if not text: continue 
 
-            # Add silence gap if needed to sync with original start time
+            # --- 1. SYNC CHECK (Wait for start time) ---
             if start_ms > current_timeline_ms:
                 gap = start_ms - current_timeline_ms
-                if gap > 10: # Only add silence if gap is significant
-                    audio_segments.append(AudioSegment.silent(duration=gap))
+                # Only fill gap if it's significant (>100ms) to avoid micro-stutters
+                if gap > 100:
+                    final_audio += AudioSegment.silent(duration=gap)
                     current_timeline_ms += gap
 
+            # --- 2. GENERATE (First Pass) ---
             temp_filename = f"temp/{user_id}_chunk_{i}.mp3"
+            
+            # Start with natural +10% speed
             communicate = edge_tts.Communicate(text, voice, rate=f"+{BASE_RATE_VAL}%", pitch=PITCH_VAL)
             await communicate.save(temp_filename)
             
             segment = AudioSegment.from_file(temp_filename)
             segment = trim_silence(segment)
 
-            # Speed up if too long
-            if len(segment) > allowed_duration_ms:
-                ratio = len(segment) / allowed_duration_ms
-                extra_speed = (ratio - 1) * 100
-                new_rate = int(BASE_RATE_VAL + extra_speed + 5)
+            # --- 3. DURATION FIT (The Fix) ---
+            current_len = len(segment)
+            
+            if current_len > allowed_duration_ms:
+                # Calculate how much faster we need to be
+                ratio = current_len / allowed_duration_ms
+                extra_speed_needed = (ratio - 1) * 100
+                new_rate = int(BASE_RATE_VAL + extra_speed_needed + 5) # +5 buffer
+                
+                # CAP the speed so it doesn't sound crazy (Max +50%)
                 if new_rate > 50: new_rate = 50
                 
+                # Re-generate with faster speed
                 communicate = edge_tts.Communicate(text, voice, rate=f"+{new_rate}%", pitch=PITCH_VAL)
                 await communicate.save(temp_filename)
+                
                 segment = AudioSegment.from_file(temp_filename)
                 segment = trim_silence(segment)
 
+            # --- 4. CRISP FILTER (Pro Version) ---
             segment = make_audio_crisp(segment)
-            audio_segments.append(segment)
+            
+            # --- 5. APPEND ---
+            final_audio += segment
             current_timeline_ms += len(segment)
             
             if os.path.exists(temp_filename): os.remove(temp_filename)
 
-        # Combine all segments at once (Much faster)
-        if audio_segments:
-            final_audio = sum(audio_segments)
-            final_audio.export(output_path, format="mp3")
-            return True, None
-        else:
-            return False, "No audio generated"
-            
+        final_audio.export(output_path, format="mp3")
+        return True, None
+
     except Exception as e:
         return False, str(e)
 
-# --- 🧠 AI ENGINES ---
+# --- 🧠 AI ENGINES (SMART SEGMENTATION) ---
 def format_timestamp(seconds):
     hours = math.floor(seconds / 3600)
     seconds %= 3600
@@ -229,13 +240,10 @@ def format_timestamp(seconds):
     return f"{hours:02}:{minutes:02}:{math.floor(seconds):02},{milliseconds:03}"
 
 def run_whisper(audio_path, srt_path, txt_path):
-    print(f"🎙️ [Whisper] Processing...")
+    print(f"🎙️ [Whisper] Processing with Smart Clauses...")
     try:
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        # Only use float16 if on CUDA
         compute_type = "float16" if device == "cuda" else "int8"
-        
-        # NOTE: Loading model inside function is slow but safer for threading if RAM is tight.
         model = WhisperModel("small", device=device, compute_type=compute_type)
         segments, _ = model.transcribe(audio_path, beam_size=5, vad_filter=True, word_timestamps=True)
         
@@ -243,6 +251,7 @@ def run_whisper(audio_path, srt_path, txt_path):
         current_segment_words = []
         current_start = None
         
+        # Settings for "GetSubs" style
         MAX_CHARS_PER_BLOCK = 80
         all_words = []
         for segment in segments:
@@ -252,11 +261,15 @@ def run_whisper(audio_path, srt_path, txt_path):
             if current_start is None: current_start = word.start
             current_segment_words.append(word)
             
+            # Text check
             text_str = " ".join([w.word.strip() for w in current_segment_words])
             clean_word = word.word.strip()
             
+            # 1. End of Sentence (.?!)
             is_sentence_end = clean_word[-1] in ".?!" if clean_word else False
+            # 2. Clause break (Comma + Length)
             is_clause_end = (clean_word[-1] == ",") and (len(text_str) > 20)
+            # 3. Too long
             is_too_long = len(text_str) > MAX_CHARS_PER_BLOCK
 
             if is_sentence_end or is_clause_end or is_too_long:
@@ -270,7 +283,6 @@ def run_whisper(audio_path, srt_path, txt_path):
                 current_segment_words = []
                 current_start = None
 
-        # Flush remaining
         if current_segment_words:
             start_ts = format_timestamp(current_start)
             end_ts = format_timestamp(all_words[-1].end)
@@ -284,7 +296,6 @@ def run_whisper(audio_path, srt_path, txt_path):
                 txt.write(f"{sub['text']} ")
         return "Whisper (Smart)"
     except Exception as e:
-        print(f"Whisper Error: {e}")
         return f"Error: {e}"
 
 def run_gemini_transcribe(audio_path, srt_path, txt_path):
@@ -294,13 +305,9 @@ def run_gemini_transcribe(audio_path, srt_path, txt_path):
         with open(audio_path, "rb") as f: audio_bytes = f.read()
         response = client.models.generate_content(
             model='gemini-2.0-flash',
-            contents=[types.Content(parts=[
-                types.Part.from_bytes(data=audio_bytes, mime_type="audio/mp3"), 
-                types.Part.from_text(text="Transcribe this audio strictly.")
-            ])]
+            contents=[types.Content(parts=[types.Part.from_bytes(data=audio_bytes, mime_type="audio/mp3"), types.Part.from_text(text="Transcribe to text.")])]
         )
         with open(txt_path, "w", encoding="utf-8") as f: f.write(response.text.strip())
-        # Remove SRT if exists to avoid confusion (since Gemini Flash only gives text here)
         if os.path.exists(srt_path): os.remove(srt_path) 
         return "Gemini Flash"
     except Exception as e:
@@ -334,7 +341,6 @@ async def run_translate(user_id, prompt_text):
 
 async def run_chat_gemini(user_id, text):
     current_time = time.time()
-    # Reset history if inactive for 24h
     if user_id in user_last_active and (current_time - user_last_active[user_id] > 86400):
         chat_histories[user_id] = []
     user_last_active[user_id] = current_time
@@ -348,7 +354,7 @@ async def run_chat_gemini(user_id, text):
     except Exception as e:
         return f"Gemini Error: {e}"
 
-# --- 🤖 HANDLERS ---
+# --- 🤖 BOT COMMANDS & HANDLERS ---
 async def post_init(application):
     await application.bot.set_my_commands([
         BotCommand("start", "🏠 Dashboard"),
@@ -356,21 +362,8 @@ async def post_init(application):
         BotCommand("translate", "🌍 Translate"),
         BotCommand("dub", "🎬 Start Dubbing"),
         BotCommand("heygemini", "🤖 Chat AI"),
-        BotCommand("cancel", "❌ Stop Mode"),
         BotCommand("clearall", "🧹 Reset All")
     ])
-
-# New separate handler for /heygemini command
-async def start_chat_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_modes[user_id] = "chat_gemini"
-    await update.message.reply_text("🤖 **Gemini Chat Mode ON**\nType `/cancel` to exit.")
-
-# New separate handler for /cancel
-async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_modes[user_id] = None
-    await update.message.reply_text("✅ **Mode Cancelled.**")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -378,8 +371,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     v_name = next((k for k, v in VOICE_LIB.items() if v == state['dub_voice']), "Unknown")
     
     text = (
-        f"👋 **Video AI Studio**\n"
-        f"⚙️ **Config:** `{state['transcribe_engine'].title()}` | `{v_name}`\n"
+        f"👋 **Welcome to Video AI Studio!**\n\n"
+        f"⚙️ **Current Settings:**\n"
+        f"├ 🎙️ **Engine:** `{state['transcribe_engine'].title()}`\n"
+        f"└ 🗣️ **Voice:** `{v_name}`\n\n"
+        f"👇 **What would you like to do?**"
     )
     
     keyboard = [
@@ -399,7 +395,7 @@ async def voices_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             row = []
     if row: keyboard.append(row)
     
-    msg_text = "🗣️ **Select Narrator:**"
+    msg_text = "🗣️ **Select a High-Quality Narrator:**\n(Click to listen to a sample)"
     if update.callback_query:
         await update.callback_query.message.edit_text(msg_text, reply_markup=InlineKeyboardMarkup(keyboard))
     else:
@@ -412,9 +408,9 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🔙 Back", callback_data="cmd_start")]
     ]
     if update.callback_query:
-        await update.callback_query.message.edit_text("⚙️ **Settings**", reply_markup=InlineKeyboardMarkup(keyboard))
+        await update.callback_query.message.edit_text("⚙️ **Prompt Settings**", reply_markup=InlineKeyboardMarkup(keyboard))
     else:
-        await update.message.reply_text("⚙️ **Settings**", reply_markup=InlineKeyboardMarkup(keyboard))
+        await update.message.reply_text("⚙️ **Prompt Settings**", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def perform_dubbing(update, context):
     user_id = update.effective_user.id
@@ -423,7 +419,7 @@ async def perform_dubbing(update, context):
     state = get_user_state(user_id)
 
     if not os.path.exists(p['srt']):
-        await msg.reply_text("❌ **No SRT found.**")
+        await msg.reply_text("❌ **No SRT found.** Send a file first.")
         return
 
     voice_name = next((k for k, v in VOICE_LIB.items() if v == state['dub_voice']), "Voice")
@@ -433,7 +429,7 @@ async def perform_dubbing(update, context):
     
     if success:
         await status.delete()
-        await context.bot.send_audio(chat_id=msg.chat_id, audio=open(p['dub_audio'], "rb"), title=f"Dubbed_{voice_name}", caption=f"✅ **Dubbed by {voice_name}**")
+        await context.bot.send_audio(chat_id=msg.chat_id, audio=open(p['dub_audio'], "rb"), title=f"Dubbed_{voice_name}", caption=f"✅ **Dubbed by {voice_name}!**")
     else:
         await status.edit_text(f"❌ Failed: {error}")
 
@@ -469,22 +465,24 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "cmd_chat":
         user_modes[user_id] = "chat_gemini"
-        await query.message.reply_text("🤖 **Chat Mode ON**\nType `/cancel` to exit.")
+        await query.message.reply_text("🤖 **Gemini Chat Mode ON**\nType `/cancel` to exit.")
         await query.answer()
 
     elif data == "cmd_clear":
         wipe_user_data(user_id)
-        await query.answer("Cleared.")
-        await query.message.reply_text("🧹 **Cleared.**")
+        await query.answer("All data cleared.")
+        await query.message.reply_text("🧹 **Workspace Cleared.**")
 
     elif data.startswith("set_voice_"):
         new_voice = data.replace("set_voice_", "")
         state['dub_voice'] = new_voice
         v_name = next((k for k, v in VOICE_LIB.items() if v == new_voice), "Custom")
         
+        # --- 🔊 GENERATE VOICE SAMPLE ---
         await query.message.edit_text(f"✅ Voice set to: **{v_name}**\n⏳ Generating sample...")
         
         if "my-MM" in new_voice: sample_text = "မင်္ဂလာပါ၊ ဒါက ကျွန်တော့်ရဲ့ အသံနမူနာပါ။"
+        elif "it-IT" in new_voice: sample_text = "Ciao, questo è un campione della mia voce."
         else: sample_text = "Hello, this is a quick sample of my voice."
         
         sample_path = f"temp/sample_{user_id}.mp3"
@@ -493,7 +491,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await communicate.save(sample_path)
             await context.bot.send_voice(chat_id=query.message.chat_id, voice=open(sample_path, "rb"), caption=f"🎙️ **{v_name}**")
         except:
-            await context.bot.send_message(chat_id=query.message.chat_id, text="❌ Error generating sample.")
+            await context.bot.send_message(chat_id=query.message.chat_id, text="❌ Could not generate sample.")
 
     elif data == "menu_settings":
         await settings_command(update, context)
@@ -521,11 +519,16 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = get_user_state(user_id)
     p = get_paths(user_id)
 
+    if text.startswith("/cancel"):
+        user_modes[user_id] = None
+        await msg.reply_text("✅ Mode exited.")
+        return
+
     # SRT Direct Paste
     if re.search(r'\d{2}:\d{2}:\d{2},\d{3} -->', text):
         with open(p['srt'], 'w', encoding="utf-8") as f: f.write(text)
         keyboard = [[InlineKeyboardButton("🎬 Dub Audio", callback_data="trigger_dub")]]
-        await msg.reply_text("✅ **SRT Saved.**", reply_markup=InlineKeyboardMarkup(keyboard))
+        await msg.reply_text("✅ **SRT Text Saved.**", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     if mode == "chat_gemini":
@@ -538,7 +541,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         key = mode.replace("edit_prompt_", "")
         state.setdefault('custom_prompts', {})[key] = text
         user_modes[user_id] = None
-        await msg.reply_text(f"✅ **{key.title()} Updated.**")
+        await msg.reply_text(f"✅ **{key.title()} Prompt Updated.**")
         return
 
     if "http" in text:
@@ -547,7 +550,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if len(text) > 5:
         with open(p['txt'], "w", encoding="utf-8") as f: f.write(text)
-        await msg.reply_text("✅ **Text Saved.** Type `/translate`.")
+        await msg.reply_text("✅ **Text Saved.** Type `/translate` to process.")
 
 async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -575,7 +578,7 @@ async def process_media(update, context, is_url):
     p = get_paths(user_id)
     state = get_user_state(user_id)
     
-    status = await msg.reply_text("⏳ **Processing...**")
+    status = await msg.reply_text("⏳ **Processing Media...**")
     try:
         clean_temp(user_id)
         if is_url:
@@ -589,16 +592,16 @@ async def process_media(update, context, is_url):
         if state['transcribe_engine'] == "whisper":
             await loop.run_in_executor(None, run_whisper, p['audio'], p['srt'], p['txt'])
             if os.path.exists(p['srt']):
-                await context.bot.send_document(msg.chat_id, open(p['srt'], "rb"), caption="🎬 **SRT Generated (Smart)**")
+                await context.bot.send_document(msg.chat_id, open(p['srt'], "rb"), caption="🎬 **SRT Generated (Smart Clause)**")
         else:
             await loop.run_in_executor(None, run_gemini_transcribe, p['audio'], p['srt'], p['txt'])
             if os.path.exists(p['txt']):
                  await context.bot.send_document(msg.chat_id, open(p['txt'], "rb"), caption="📄 **Transcript Generated**")
             
-        await status.edit_text("✅ **Done!** Type `/translate` or `/dub`.")
+        await status.edit_text("✅ **Done!** Type `/translate` to translate or `/dub` to dub.")
 
     except Exception as e:
-        await status.edit_text(f"❌ Error: {e}")
+        await status.edit_text(f"❌ Processing Error: {e}")
 
 if __name__ == '__main__':
     print("🚀 Video AI Bot Running...")
@@ -612,10 +615,9 @@ if __name__ == '__main__':
         [InlineKeyboardButton("To Burmese", callback_data="trans_burmese")]
     ]))))
     app.add_handler(CommandHandler("dub", perform_dubbing))
-    # FIXED: Replaced lambda with actual functions
-    app.add_handler(CommandHandler("heygemini", start_chat_mode))
-    app.add_handler(CommandHandler("cancel", cancel_command))
+    app.add_handler(CommandHandler("heygemini", lambda u, c: callback_handler(u, c)))
     app.add_handler(CommandHandler("clearall", lambda u, c: wipe_user_data(u.effective_user.id)))
+    app.add_handler(CommandHandler("cancel", lambda u, c: u.message.reply_text("✅ Cancelled.")))
 
     # Handlers
     app.add_handler(CallbackQueryHandler(callback_handler))
