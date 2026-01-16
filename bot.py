@@ -10,6 +10,7 @@ import shutil
 import re
 import time
 import random
+import requests # ✅ Added for Gemini API Call
 
 # User Data Storage
 user_prefs = {}
@@ -41,7 +42,7 @@ if not TG_TOKEN or not GEMINI_KEY:
 
 # --- 🗣️ VOICE LIBRARY ---
 # STANDARD: Works for SRT Dubbing & Text (Edge TTS)
-# GEMINI: Works for Text Only (Google GenAI)
+# GEMINI: Works for Text Only (Google API)
 VOICE_LIB = {
     # --- Standard (SRT Supported) ---
     "🇲🇲 Burmese (Thiha)": "my-MM-ThihaNeural",
@@ -50,14 +51,18 @@ VOICE_LIB = {
     "🇺🇸 Eric (Energetic)": "en-US-EricNeural",
     "🇺🇸 Brian (Classic)": "en-US-BrianNeural",
     "🇬🇧 Ryan (British)": "en-GB-RyanNeural",
-    "🇮🇹 Giuseppe (Italian)": "it-IT-GiuseppeMultilingualNeural",
     
     # --- Gemini (Text Only - No SRT) ---
-    "✨ Gemini Journey (F)": "gemini-journey-F",
-    "✨ Gemini Journey (M)": "gemini-journey-M",
-    "✨ Gemini Barnaby": "gemini-barnaby",
-    "✨ Gemini Puck": "gemini-puck",
-    "✨ Gemini Zephyr": "gemini-zephyr"
+    # These map to the "Voice" param in Google's API
+    "✨ Gemini Alloy": "alloy",
+    "✨ Gemini Echo": "echo",
+    "✨ Gemini Shimmer": "shimmer",
+    "✨ Gemini Puck": "Puck",
+    "✨ Gemini Zephyr": "Zephyr",
+    "✨ Gemini Aoede": "Aoede",
+    "✨ Gemini Charon": "Charon",
+    "✨ Gemini Fenrir": "Fenrir",
+    "✨ Gemini Kore": "Kore"
 }
 
 # --- 📝 PROMPTS ---
@@ -164,15 +169,47 @@ def make_audio_crisp(audio_segment):
     high_freqs = clean.high_pass_filter(2000)
     return effects.normalize(clean.overlay(high_freqs - 4))
 
+# --- 🗣️ REAL GEMINI TTS FUNCTION ---
+async def generate_gemini_tts(text, voice_id, output_path):
+    """
+    Calls Google's OpenAI-Compatible Speech Endpoint.
+    Works with Free Tier API Keys in supported regions.
+    """
+    url = "https://generativelanguage.googleapis.com/v1beta/openai/audio/speech"
+    headers = {
+        "Authorization": f"Bearer {GEMINI_KEY}",
+        "Content-Type": "application/json"
+    }
+    data = {
+        "model": "tts-1", # Standard model name for compatibility
+        "input": text,
+        "voice": voice_id # Puck, Zephyr, Alloy, etc.
+    }
+    
+    try:
+        # We run the blocking request in a separate thread to not freeze the bot
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(None, lambda: requests.post(url, headers=headers, json=data))
+        
+        if response.status_code == 200:
+            with open(output_path, "wb") as f:
+                f.write(response.content)
+            return True, output_path
+        else:
+            return False, f"API Error {response.status_code}: {response.text}"
+            
+    except Exception as e:
+        return False, str(e)
+
+
 async def generate_voice_sample(user_id, voice_code):
     p = get_paths(user_id)
     
-    # 1. Gemini Voice (Simulated for Sample)
-    if "gemini-" in voice_code:
-        # Since we don't have the paid endpoint active here, 
-        # we return a text warning or a generic sample if possible.
-        # For this code, we will skip sample generation for Gemini to avoid errors
-        return False, "Gemini samples require Text Input."
+    # 1. Gemini Voice
+    # Now we use the REAL function!
+    if voice_code in ["Puck", "Zephyr", "Aoede", "Charon", "Fenrir", "Kore", "alloy", "echo", "shimmer"]:
+        text = "Hello! This is a sample of my AI voice."
+        return await generate_gemini_tts(text, voice_code, p['sample'])
 
     # 2. Edge TTS (Standard)
     text = "Hello! This is a sample of my voice."
@@ -187,9 +224,11 @@ async def generate_voice_sample(user_id, voice_code):
 
 # --- 🎬 DUBBING ENGINE (SRT) ---
 async def generate_dubbing(user_id, srt_path, output_path, voice):
-    # ⛔ Block Gemini Voices for SRT
-    if "gemini-" in voice:
-        return False, "⛔ Gemini voices are for **Text Only**. Please select a Standard voice for SRT Dubbing."
+    # ⛔ Block Gemini Voices for SRT (Timestamp syncing not supported yet)
+    # Check if voice is in our Gemini list
+    gemini_voices = ["Puck", "Zephyr", "Aoede", "Charon", "Fenrir", "Kore", "alloy", "echo", "shimmer"]
+    if voice in gemini_voices:
+        return False, "⛔ Gemini voices are for **Text Only**.\nThey cannot be used for SRT Dubbing.\nPlease select a Standard voice (e.g., Thiha, Chris)."
 
     print(f"🎬 Starting Dubbing for {user_id}...")
     try:
@@ -356,7 +395,7 @@ async def voices_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = []
     row = []
     for name, code in VOICE_LIB.items():
-        # Shorten label
+        # Labeling
         label = name.split("(")[0].strip() + (" (Gemini)" if "Gemini" in name else "")
         row.append(InlineKeyboardButton(label, callback_data=f"set_voice_{code}"))
         if len(row) == 2:
@@ -364,7 +403,7 @@ async def voices_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             row = []
     if row: keyboard.append(row)
     
-    await update.message.reply_text("🗣️ **Select Voice:**\n(Note: Gemini voices work for Text Only)", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text("🗣️ **Select Voice:**\n(Gemini = Text Only, Standard = SRT & Text)", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
@@ -396,7 +435,8 @@ async def perform_dubbing(update, context):
         return
 
     # Check Compatibility
-    if "gemini-" in state['dub_voice']:
+    gemini_voices = ["Puck", "Zephyr", "Aoede", "Charon", "Fenrir", "Kore", "alloy", "echo", "shimmer"]
+    if state['dub_voice'] in gemini_voices:
         await msg.reply_text("⛔ **Gemini Voice Error**\nGemini voices do not support SRT Dubbing.\nPlease switch to a Standard voice (e.g., Thiha, Chris).")
         return
 
@@ -461,19 +501,20 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         v_name = next((k for k, v in VOICE_LIB.items() if v == new_voice), "Voice")
         
         # Check compatibility
-        note = ""
-        if "gemini-" in new_voice:
-            note = "\n⚠️ Text Only (No SRT)"
+        gemini_voices = ["Puck", "Zephyr", "Aoede", "Charon", "Fenrir", "Kore", "alloy", "echo", "shimmer"]
+        if new_voice in gemini_voices:
             await query.answer(f"Selected: {v_name} (Text Only)")
+            await query.message.edit_text(f"✅ **{v_name}** selected.\n(Use with Text only, not SRT)")
         else:
-            # Generate Sample for Standard Voices
             await query.answer(f"Selected: {v_name}")
             await query.message.edit_text(f"⏳ **Generating Sample for {v_name}...**")
-            success, sample_path = await generate_voice_sample(user_id, new_voice)
-            if success:
-                await context.bot.send_voice(chat_id=query.message.chat_id, voice=open(sample_path, "rb"), caption=f"🗣️ Sample: {v_name}")
+            
+        # Attempt to generate sample (now works for Gemini too!)
+        success, sample_path = await generate_voice_sample(user_id, new_voice)
+        if success:
+            await context.bot.send_voice(chat_id=query.message.chat_id, voice=open(sample_path, "rb"), caption=f"🗣️ Sample: {v_name}")
 
-        await start(update, context) # Return to home
+        await start(update, context)
 
     elif data == "menu_settings":
         await settings_command(update, context)
@@ -566,12 +607,18 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 3. TEXT-TO-SPEECH (TTS)
     if len(text) < 2000:
+        gemini_voices = ["Puck", "Zephyr", "Aoede", "Charon", "Fenrir", "Kore", "alloy", "echo", "shimmer"]
+        
         # GEMINI TTS LOGIC
-        if "gemini-" in state['dub_voice']:
-            await msg.reply_text(f"✨ **Generating Gemini TTS...**\n(Note: Requires Paid Google Audio API)")
-            # Simulated call (Replace with actual Google Speech API if available)
-            # success = await generate_gemini_tts(text, voice) 
-            await msg.reply_text("⚠️ Gemini TTS Endpoint not configured in this script. Please use Standard voices for now.")
+        if state['dub_voice'] in gemini_voices:
+            status = await msg.reply_text(f"✨ **Generating ({state['dub_voice']})...**")
+            success, path = await generate_gemini_tts(text, state['dub_voice'], p['sample'])
+            
+            if success:
+                await status.delete()
+                await context.bot.send_voice(chat_id=msg.chat_id, voice=open(path, "rb"))
+            else:
+                await status.edit_text(f"❌ Error: {path}") # path contains error message here
             return
 
         # EDGE TTS (Standard)
