@@ -35,8 +35,8 @@ if not TG_TOKEN or not GEMINI_KEY:
 # --- 🗣️ VOICE LIBRARY ---
 VOICE_LIB = {
     "🇲🇲 Burmese (Male)": "my-MM-ThihaNeural",
-    "🇲🇲 Burmese (Female)": "my-MM-NularNeural",
-    "🇺🇸 Remy (Multi)": "en-US-RemyMultilingualNeural",
+    "🇲🇲 Burmese (Female)": "my-MM-NilarNeural",
+    "🇺🇸 Remy (Multi)": "fr-FR-RemyMultilingualNeural",
     "🇮🇹 Giuseppe (Multi)": "it-IT-GiuseppeMultilingualNeural",
     "🇺🇸 Brian (Male)": "en-US-BrianNeural",
     "🇺🇸 Andrew (Male)": "en-US-AndrewNeural"
@@ -227,7 +227,7 @@ async def generate_dubbing(user_id, srt_path, output_path, voice):
 
 # --- 🧠 ENGINES ---
 def run_whisper(audio_path, srt_path, txt_path):
-    print(f"🎙️ [Whisper] Processing with Sentence Splitting...")
+    print(f"🎙️ [Whisper] Processing with Smart Segmentation...")
     try:
         device = "cuda" if torch.cuda.is_available() else "cpu"
         compute_type = "float16" if device == "cuda" else "int8"
@@ -235,50 +235,86 @@ def run_whisper(audio_path, srt_path, txt_path):
         # Load Model
         model = WhisperModel("small", device=device, compute_type=compute_type)
         
+        # Transcribe with word timestamps
         segments, _ = model.transcribe(audio_path, beam_size=1, vad_filter=True, word_timestamps=True)
         
         final_subs = []
-        current_text = []
+        current_segment_words = []
         current_start = None
         
-        MAX_CHARS = 100 
+        # Constraints
+        MAX_CHARS = 80       # Soft limit for subtitle length
+        MAX_DURATION = 7.0   # Max seconds per subtitle
+        MIN_DURATION = 1.0   # Min seconds (avoid tiny flashes)
 
         for segment in segments:
             for word in segment.words:
                 if current_start is None:
                     current_start = word.start
                 
-                current_text.append(word.word.strip())
+                current_segment_words.append(word)
                 
-                text_str = " ".join(current_text)
-                is_end_of_sentence = word.word.strip()[-1] in ".?!"
-                is_too_long = len(text_str) > MAX_CHARS
+                # --- CHECK BREAK CONDITIONS ---
+                text_so_far = " ".join([w.word.strip() for w in current_segment_words])
+                duration_so_far = word.end - current_start
+                
+                # 1. End of Sentence (Strongest Break)
+                is_eos = word.word.strip()[-1] in ".?!"
+                
+                # 2. Length Constraints
+                is_too_long_char = len(text_so_far) > MAX_CHARS
+                is_too_long_time = duration_so_far > MAX_DURATION
+                
+                # 3. Natural Comma Break (only if we are getting long)
+                is_comma = word.word.strip()[-1] == ","
+                is_getting_long = len(text_so_far) > 40
+                
+                # DECISION: Cut here?
+                should_cut = False
+                
+                # Priority A: Hard sentence end
+                if is_eos: 
+                    should_cut = True
+                
+                # Priority B: Too long physically or temporally -> Find best break
+                elif (is_too_long_char or is_too_long_time):
+                    should_cut = True
+                    
+                # Priority C: Nice comma break if subtitle is already substantial
+                elif is_comma and is_getting_long:
+                    should_cut = True
 
-                if is_end_of_sentence or is_too_long:
-                    start_ts = format_timestamp(current_start)
-                    end_ts = format_timestamp(word.end)
+                if should_cut:
+                    # Finalize this subtitle
                     final_subs.append({
-                        "start": start_ts,
-                        "end": end_ts,
-                        "text": text_str
+                        "start": format_timestamp(current_start),
+                        "end": format_timestamp(word.end),
+                        "text": text_so_far
                     })
-                    current_text = []
+                    # Reset
+                    current_segment_words = []
                     current_start = None
 
-        if current_text:
+        # Clean up any remaining words
+        if current_segment_words:
+            text_so_far = " ".join([w.word.strip() for w in current_segment_words])
             start_ts = format_timestamp(current_start) if current_start else "00:00:00,000"
+            # Use the end of the last word in the list
+            end_ts = format_timestamp(current_segment_words[-1].end)
+            
             final_subs.append({
                 "start": start_ts,
-                "end": format_timestamp(segments[-1].end),
-                "text": " ".join(current_text)
+                "end": end_ts,
+                "text": text_so_far
             })
 
+        # Save to Files
         with open(srt_path, "w", encoding="utf-8") as srt, open(txt_path, "w", encoding="utf-8") as txt:
             for i, sub in enumerate(final_subs, start=1):
                 srt.write(f"{i}\n{sub['start']} --> {sub['end']}\n{sub['text']}\n\n")
                 txt.write(f"{sub['text']} ")
                 
-        return "Whisper (Sentence Mode)"
+        return "Whisper (Smart Mode)"
     except Exception as e:
         return f"Error: {e}"
 
