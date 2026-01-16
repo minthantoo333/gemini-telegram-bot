@@ -7,17 +7,13 @@ import torch
 import pysrt
 import math
 import shutil
-import re 
-
-# User Data
-user_prefs = {}
-user_modes = {} 
-chat_histories = {}
-user_last_active = {} # 🕒 Last Active Time မှတ်ဖို့
+import re
+import time
+from typing import Tuple, Optional
 
 # Audio Processing
 from pydub import AudioSegment, effects
-from pydub.silence import detect_leading_silence # Added for trimming silence
+from pydub.silence import detect_leading_silence
 import edge_tts
 
 # Telegram
@@ -33,18 +29,29 @@ from faster_whisper import WhisperModel
 TG_TOKEN = os.getenv("TG_TOKEN")
 GEMINI_KEY = os.getenv("GEMINI_KEY")
 
+# Define Models
+MODEL_NORMAL = "gemini-2.0-flash"
+MODEL_THINKING = "gemini-2.0-flash-thinking-exp-1219"
+
 if not TG_TOKEN or not GEMINI_KEY:
-    print("❌ ERROR: API Keys are missing! Set them in your environment variables.")
+    print("❌ ERROR: API Keys are missing! Set TG_TOKEN and GEMINI_KEY env vars.")
     exit()
 
 # --- 🗣️ VOICE LIBRARY ---
+# Engine: "edge" (Free, Good) or "gemini" (Paid/Free Tier, High Quality)
 VOICE_LIB = {
-    "🇲🇲 Burmese (Male)": "my-MM-ThihaNeural",
-    "🇲🇲 Burmese (Female)": "my-MM-NularNeural",
-    "🇺🇸 Remy (Multi)": "en-US-RemyMultilingualNeural",
-    "🇮🇹 Giuseppe (Multi)": "it-IT-GiuseppeMultilingualNeural",
-    "🇺🇸 Brian (Male)": "en-US-BrianNeural",
-    "🇺🇸 Andrew (Male)": "en-US-AndrewNeural"
+    # Edge TTS
+    "🇲🇲 Burmese (Male)": {"id": "my-MM-ThihaNeural", "engine": "edge"},
+    "🇲🇲 Burmese (Female)": {"id": "my-MM-NularNeural", "engine": "edge"},
+    "🇺🇸 Remy (Multi)": {"id": "en-US-RemyMultilingualNeural", "engine": "edge"},
+    "🇺🇸 Brian (Male)": {"id": "en-US-BrianNeural", "engine": "edge"},
+    
+    # Gemini Voices
+    "🤖 Gemini Alloy": {"id": "Puck", "engine": "gemini"},
+    "🤖 Gemini Charon": {"id": "Charon", "engine": "gemini"},
+    "🤖 Gemini Fenrir": {"id": "Fenrir", "engine": "gemini"},
+    "🤖 Gemini Aoede": {"id": "Aoede", "engine": "gemini"},
+    "🤖 Gemini Kore": {"id": "Kore", "engine": "gemini"}
 }
 
 # --- 📝 PROMPTS ---
@@ -75,10 +82,11 @@ BASE_FOLDERS = ["downloads", "temp"]
 for f in BASE_FOLDERS:
     os.makedirs(f, exist_ok=True)
 
-# User Data
+# User Data Storage
 user_prefs = {}
 user_modes = {} 
-chat_histories = {} 
+chat_histories = {}
+user_last_active = {}
 
 # --- 🛠️ HELPER FUNCTIONS ---
 def get_user_state(user_id):
@@ -86,6 +94,8 @@ def get_user_state(user_id):
         user_prefs[user_id] = {
             "transcribe_engine": "whisper", 
             "dub_voice": "my-MM-ThihaNeural", 
+            "dub_engine": "edge",
+            "thinking_mode": False, # Default OFF
             "custom_prompts": {} 
         }
     return user_prefs[user_id]
@@ -134,114 +144,6 @@ async def send_copyable_message(chat_id, bot, text):
 
 # --- 🔊 AUDIO POST-PROCESSING ---
 def trim_silence(audio_segment, silence_thresh=-40.0, chunk_size=10):
-    """Trims silence from the beginning and end of an audio segment."""
-    if len(audio_segment) < 100:  # Skip if too short
-        return audio_segment
-        
-    start_trim = detect_leading_silence(audio_segment, silence_threshold=silence_thresh, chunk_size=chunk_size)
-    end_trim = detect_leading_silence(audio_segment.reverse(), silence_threshold=silence_thresh, chunk_size=chunk_size)
-    
-    duration = len(audio_segment)
-    trimmed = audio_segment[start_trim:duration-end_trim]
-    return trimmed
-
-def make_audio_crisp(audio_segment):
-    """Applies filters to make voice sound sharper and clearer."""
-    clean_audio = audio_segment.high_pass_filter(200)
-    high_freqs = clean_audio.high_pass_filter(2000)
-    # Slightly reduced boost to prevent harshness
-    crisp_audio = clean_audio.overlay(high_freqs - 4) 
-    final_audio = effects.normalize(crisp_audio)
-    return final_audio
-
-# --- 🎬 DUBBING ENGINE (HYBRID: NATURAL + SYNCED) ---
-async def generate_dubbing(user_id, srt_path, output_path, voice):
-    """
-    Hybrid Approach:
-    1. Starts with Voicertool-like settings (+10% speed, -2Hz pitch).
-    2. CHECKS duration. If audio is too long, speeds it up GENTLY to fit.
-    3. Maintains sync by adding silence only when necessary (large gaps).
-    """
-    print(f"🎬 Starting Dubbing (Synced + Natural) for {user_id}...")
-    try:
-        subs = pysrt.open(srt_path)
-        final_audio = AudioSegment.empty()
-        current_timeline_ms = 0
-        
-        # --- BASE SETTINGS ---
-        # Start with a comfortable speed that matches Voicertool
-        BASE_RATE_VAL = 10 # +10%
-        PITCH_VAL = "-2Hz"
-
-        for i, sub in enumerate(subs):
-            start_ms = (sub.start.hours * 3600 + sub.start.minutes * 60 + sub.start.seconds) * 1000 + sub.start.milliseconds
-            end_ms = (sub.end.hours * 3600 + sub.end.minutes * 60 + sub.end.seconds) * 1000 + sub.end.milliseconds
-            allowed_duration_ms = end_ms - start_ms
-            
-            text = sub.text.replace("\n", " ").strip()
-            if not text: continue 
-
-            # --- 1. SYNC CHECK (Wait for start time) ---
-            # If the previous audio finished EARLY, we must wait for this subtitle's start time.
-            # Otherwise, the audio will drift and happen too soon.
-            if start_ms > current_timeline_ms:
-                gap = start_ms - current_timeline_ms
-                # Only fill gap if it's significant (>100ms) to avoid micro-stutters
-                if gap > 100:
-                    final_audio += AudioSegment.silent(duration=gap)
-                    current_timeline_ms += gap
-
-            # --- 2. GENERATE (First Pass) ---
-            temp_filename = f"temp/{user_id}_chunk_{i}.mp3"
-            
-            # Start with natural +10% speed
-            communicate = edge_tts.Communicate(text, voice, rate=f"+{BASE_RATE_VAL}%", pitch=PITCH_VAL)
-            await communicate.save(temp_filename)
-            
-            segment = AudioSegment.from_file(temp_filename)
-            segment = trim_silence(segment, silence_thresh=-40.0, chunk_size=5)
-
-            # --- 3. DURATION FIT (The Fix) ---
-            # Check if natural voice is too long for the timestamp
-            current_len = len(segment)
-            
-            if current_len > allowed_duration_ms:
-                # Calculate how much faster we need to be
-                ratio = current_len / allowed_duration_ms
-                
-                # Calculate new percentage needed (e.g., if ratio is 1.2, we need +20% MORE)
-                # We add this to our base rate of 10
-                extra_speed_needed = (ratio - 1) * 100
-                new_rate = int(BASE_RATE_VAL + extra_speed_needed + 5) # +5 buffer
-                
-                # CAP the speed so it doesn't sound crazy (Max +50%)
-                if new_rate > 50: new_rate = 50
-                
-                # Re-generate with faster speed
-                communicate = edge_tts.Communicate(text, voice, rate=f"+{new_rate}%", pitch=PITCH_VAL)
-                await communicate.save(temp_filename)
-                
-                # Load and Trim again
-                segment = AudioSegment.from_file(temp_filename)
-                segment = trim_silence(segment)
-
-            # --- 4. CRISP FILTER ---
-            segment = make_audio_crisp(segment)
-            
-            # --- 5. APPEND ---
-            final_audio += segment
-            current_timeline_ms += len(segment)
-            
-            if os.path.exists(temp_filename): os.remove(temp_filename)
-
-        final_audio.export(output_path, format="mp3")
-        return True, None
-
-    except Exception as e:
-        return False, str(e)
-
-# --- Ensure these helpers are present ---
-def trim_silence(audio_segment, silence_thresh=-40.0, chunk_size=5):
     if len(audio_segment) < 100: return audio_segment
     start_trim = detect_leading_silence(audio_segment, silence_threshold=silence_thresh, chunk_size=chunk_size)
     end_trim = detect_leading_silence(audio_segment.reverse(), silence_threshold=silence_thresh, chunk_size=chunk_size)
@@ -249,81 +151,151 @@ def trim_silence(audio_segment, silence_thresh=-40.0, chunk_size=5):
     return audio_segment[start_trim:duration-end_trim]
 
 def make_audio_crisp(audio_segment):
-    clean = audio_segment.high_pass_filter(150)
-    return effects.normalize(clean)
+    clean_audio = audio_segment.high_pass_filter(200)
+    high_freqs = clean_audio.high_pass_filter(2000)
+    crisp_audio = clean_audio.overlay(high_freqs - 4) 
+    final_audio = effects.normalize(crisp_audio)
+    return final_audio
 
-# --- 🧠 ENGINES ---
+def format_timestamp(seconds):
+    hours = math.floor(seconds / 3600)
+    seconds %= 3600
+    minutes = math.floor(seconds / 60)
+    seconds %= 60
+    milliseconds = round((seconds - math.floor(seconds)) * 1000)
+    return f"{hours:02}:{minutes:02}:{math.floor(seconds):02},{milliseconds:03}"
+
+# --- 🎬 DUBBING ENGINE (EDGE + GEMINI) ---
+async def generate_dubbing(user_id, srt_path, output_path, voice_id):
+    state = get_user_state(user_id)
+    engine_type = state.get('dub_engine', 'edge')
+    
+    print(f"🎬 Dubbing for {user_id} using {engine_type} ({voice_id})...")
+
+    try:
+        subs = pysrt.open(srt_path)
+        final_audio = AudioSegment.empty()
+        current_timeline_ms = 0
+        
+        # Edge Settings
+        BASE_RATE_VAL = 10 
+        PITCH_VAL = "-2Hz"
+
+        # Gemini Client Init
+        client = None
+        if engine_type == "gemini":
+            client = genai.Client(api_key=GEMINI_KEY)
+
+        for i, sub in enumerate(subs):
+            start_ms = (sub.start.hours * 3600 + sub.start.minutes * 60 + sub.start.seconds) * 1000 + sub.start.milliseconds
+            text = sub.text.replace("\n", " ").strip()
+            if not text: continue 
+
+            # --- 1. SYNC CHECK ---
+            if start_ms > current_timeline_ms:
+                gap = start_ms - current_timeline_ms
+                if gap > 100:
+                    final_audio += AudioSegment.silent(duration=gap)
+                    current_timeline_ms += gap
+
+            # --- 2. GENERATE AUDIO CHUNK ---
+            temp_filename = f"temp/{user_id}_chunk_{i}.mp3"
+            
+            if engine_type == "edge":
+                # === EDGE TTS ===
+                communicate = edge_tts.Communicate(text, voice_id, rate=f"+{BASE_RATE_VAL}%", pitch=PITCH_VAL)
+                await communicate.save(temp_filename)
+                
+            elif engine_type == "gemini":
+                # === GEMINI TTS ===
+                try:
+                    response = client.models.generate_content(
+                        model='gemini-2.0-flash', 
+                        contents=text,
+                        config=types.GenerateContentConfig(
+                            response_mime_type="audio/mp3",
+                            speech_config=types.SpeechConfig(
+                                voice_config=types.VoiceConfig(
+                                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                        voice_name=voice_id
+                                    )
+                                )
+                            )
+                        )
+                    )
+                    with open(temp_filename, "wb") as f:
+                        f.write(response.parts[0].inline_data.data)
+                except Exception as e:
+                    print(f"Gemini TTS Error chunk {i}: {e}")
+                    continue 
+
+            # --- 3. PROCESS & APPEND ---
+            if os.path.exists(temp_filename):
+                segment = AudioSegment.from_file(temp_filename)
+                segment = trim_silence(segment, silence_thresh=-40.0, chunk_size=5)
+                
+                # Gemini Speed Fix (Optional: +10% speed)
+                if engine_type == "gemini":
+                    segment = segment.speedup(playback_speed=1.1) 
+
+                segment = make_audio_crisp(segment)
+                final_audio += segment
+                current_timeline_ms += len(segment)
+                os.remove(temp_filename)
+
+        final_audio.export(output_path, format="mp3")
+        return True, None
+
+    except Exception as e:
+        return False, str(e)
+
+# --- 🧠 ENGINES (WHISPER & GEMINI) ---
 def run_whisper(audio_path, srt_path, txt_path):
-    print(f"🎙️ [Whisper] Processing with Sentence Splitting...")
+    print(f"🎙️ [Whisper] Processing...")
     try:
         device = "cuda" if torch.cuda.is_available() else "cpu"
         compute_type = "float16" if device == "cuda" else "int8"
-        
-        # Load Model
         model = WhisperModel("small", device=device, compute_type=compute_type)
-        
-        # 1. word_timestamps=True က အရေးအကြီးဆုံးပါ
-        # ဒါမှ စကားလုံးတစ်လုံးချင်းစီ ဘယ်အချိန်စပြီး ဘယ်အချိန်ဆုံးလဲ သိမှာပါ
         segments, _ = model.transcribe(audio_path, beam_size=1, vad_filter=True, word_timestamps=True)
         
-        # --- SENTENCE RE-GROUPING LOGIC ---
         final_subs = []
         current_text = []
         current_start = None
-        
-        # စာကြောင်းတစ်ကြောင်း အရမ်းရှည်မသွားအောင် ထိန်းဖို့ (Optional)
         MAX_CHARS = 100 
 
         for segment in segments:
             for word in segment.words:
-                if current_start is None:
-                    current_start = word.start
-                
-                # စကားလုံးထည့်မယ်
+                if current_start is None: current_start = word.start
                 current_text.append(word.word.strip())
                 
-                # စစ်ဆေးမယ့် အချက်များ:
-                # ၁. ပုဒ်မ (. ? !) နဲ့ဆုံးလား?
-                # ၂. ဒါမှမဟုတ် စာလုံးရေ အရမ်းများနေပြီလား? (MAX_CHARS ကျော်ရင် အတင်းဖြတ်မယ်)
                 text_str = " ".join(current_text)
-                is_end_of_sentence = word.word.strip()[-1] in ".?!"
-                is_too_long = len(text_str) > MAX_CHARS
+                is_end = word.word.strip()[-1] in ".?!"
+                is_long = len(text_str) > MAX_CHARS
 
-                if is_end_of_sentence or is_too_long:
-                    start_ts = format_timestamp(current_start)
-                    end_ts = format_timestamp(word.end)
+                if is_end or is_long:
                     final_subs.append({
-                        "start": start_ts,
-                        "end": end_ts,
+                        "start": format_timestamp(current_start),
+                        "end": format_timestamp(word.end),
                         "text": text_str
                     })
-                    # Reset
                     current_text = []
                     current_start = None
 
-        # ကျန်နေခဲ့တဲ့ စာများရှိရင် နောက်ဆုံး စာကြောင်းအဖြစ် ထည့်မယ်
         if current_text:
-            # Note: We use the last known word end time, but simplified here
-            start_ts = format_timestamp(current_start) if current_start else "00:00:00,000"
-            # Just approximation for end time if strictly needed, or use last word's end
-            # For robustness, usually we track the last word object. 
-            # But normally the loop handles most.
             final_subs.append({
-                "start": start_ts,
-                "end": format_timestamp(segments[-1].end), # Fallback to segment end
+                "start": format_timestamp(current_start) if current_start else "00:00:00,000",
+                "end": format_timestamp(segments[-1].end),
                 "text": " ".join(current_text)
             })
 
-        # File ထဲ ပြန်ရေးမယ်
         with open(srt_path, "w", encoding="utf-8") as srt, open(txt_path, "w", encoding="utf-8") as txt:
             for i, sub in enumerate(final_subs, start=1):
                 srt.write(f"{i}\n{sub['start']} --> {sub['end']}\n{sub['text']}\n\n")
                 txt.write(f"{sub['text']} ")
                 
-        return "Whisper (Sentence Mode)"
+        return "Whisper"
     except Exception as e:
         return f"Error: {e}"
-
 
 def run_gemini_transcribe(audio_path, srt_path, txt_path):
     print(f"✨ [Gemini] Listening...")
@@ -340,19 +312,16 @@ def run_gemini_transcribe(audio_path, srt_path, txt_path):
     except Exception as e:
         return "Error"
 
-def format_timestamp(seconds):
-    hours = math.floor(seconds / 3600)
-    seconds %= 3600
-    minutes = math.floor(seconds / 60)
-    seconds %= 60
-    milliseconds = round((seconds - math.floor(seconds)) * 1000)
-    return f"{hours:02}:{minutes:02}:{math.floor(seconds):02},{milliseconds:03}"
-
-# --- 🧠 TRANSLATION ---
+# --- 🧠 TRANSLATION (WITH THINKING MODE) ---
 async def run_translate(user_id, prompt_text):
     p = get_paths(user_id)
     source_path = p['srt'] if os.path.exists(p['srt']) else p['txt'] if os.path.exists(p['txt']) else None
     if not source_path: return False, "❌ No file found.", None
+
+    state = get_user_state(user_id)
+    # Model Selection
+    active_model = MODEL_THINKING if state.get('thinking_mode') else MODEL_NORMAL
+    print(f"🌍 Translating with {active_model} for {user_id}")
 
     is_srt = source_path.endswith('.srt')
     client = genai.Client(api_key=GEMINI_KEY)
@@ -367,7 +336,7 @@ async def run_translate(user_id, prompt_text):
         output_ext = ".txt"
     
     try:
-        response = client.models.generate_content(model='gemini-2.0-flash', contents=ai_prompt)
+        response = client.models.generate_content(model=active_model, contents=ai_prompt)
         content = response.text.strip().replace("```srt", "").replace("```", "").strip()
         final_path = p['trans_result'] + output_ext
         with open(final_path, "w", encoding="utf-8") as f: f.write(content)
@@ -376,30 +345,28 @@ async def run_translate(user_id, prompt_text):
     except Exception as e:
         return False, str(e), None
 
-# --- 🤖 CHAT GEMINI WITH AUTO-DELETE ---
+# --- 🤖 CHAT GEMINI (WITH THINKING MODE) ---
 async def run_chat_gemini(user_id, text):
     current_time = time.time()
-    ONE_DAY_SECONDS = 86400 # 24 Hours
+    ONE_DAY_SECONDS = 86400 
 
-    # 1. Check & Auto Delete
-    # အရင်မှတ်ထားတဲ့ အချိန်ရှိပြီး၊ အဲဒီအချိန်က ၂၄ နာရီကျော်သွားပြီဆိုရင် History ကို ရှင်းမယ်
+    # Auto Delete History
     if user_id in user_last_active:
         if current_time - user_last_active[user_id] > ONE_DAY_SECONDS:
-            chat_histories[user_id] = [] # Reset History
-            print(f"🧹 Auto-cleared history for {user_id} (Expired)")
+            chat_histories[user_id] = []
+            print(f"🧹 Auto-cleared history for {user_id}")
 
-    # 2. Update Last Active Time
     user_last_active[user_id] = current_time
-
-    # 3. Normal Chat Process
     if user_id not in chat_histories: chat_histories[user_id] = []
     
+    state = get_user_state(user_id)
+    active_model = MODEL_THINKING if state.get('thinking_mode') else MODEL_NORMAL
+    
     client = genai.Client(api_key=GEMINI_KEY)
-    chat = client.chats.create(model='gemini-2.0-flash', history=chat_histories[user_id])
+    chat = client.chats.create(model=active_model, history=chat_histories[user_id])
     
     try:
         response = chat.send_message(text)
-        # History is managed by Gemini object/list automatically in this session
         return response.text
     except Exception as e:
         return f"Gemini Error: {e}"
@@ -411,7 +378,7 @@ async def post_init(application):
         BotCommand("voices", "🗣️ Change Voice"),
         BotCommand("translate", "🌍 Translate"),
         BotCommand("dub", "🎬 Dub Audio"),
-        BotCommand("settings", "⚙️ Prompts"),
+        BotCommand("settings", "⚙️ AI Settings"),
         BotCommand("heygemini", "🤖 Chat"),
         BotCommand("clearall", "🧹 Clear"),
         BotCommand("cancel", "❌ Cancel")
@@ -421,19 +388,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     state = get_user_state(user_id)
     
-    voice_name = next((k for k, v in VOICE_LIB.items() if v == state['dub_voice']), "Unknown")
+    voice_name = next((k for k, v in VOICE_LIB.items() if v['id'] == state['dub_voice']), "Unknown")
+    engine = state.get('dub_engine', 'edge').title()
+    
     keyboard = [
         [InlineKeyboardButton(f"🎙️ Engine: {state['transcribe_engine'].title()}", callback_data="toggle_transcribe")],
-        [InlineKeyboardButton(f"🗣️ Voice: {voice_name}", callback_data="cmd_voices")],
-        [InlineKeyboardButton("⚙️ Settings", callback_data="menu_settings")]
+        [InlineKeyboardButton(f"🗣️ Voice: {voice_name} ({engine})", callback_data="cmd_voices")],
+        [InlineKeyboardButton("⚙️ AI & Prompts", callback_data="menu_settings")]
     ]
     await update.message.reply_text("👋 **Video AI Studio**\nSend Video, Audio, SRT or TXT.", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def voices_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = []
     row = []
-    for name, code in VOICE_LIB.items():
-        row.append(InlineKeyboardButton(name, callback_data=f"set_voice_{code}"))
+    for name, data in VOICE_LIB.items():
+        row.append(InlineKeyboardButton(name, callback_data=f"set_voice_{data['id']}"))
         if len(row) == 2:
             keyboard.append(row)
             row = []
@@ -441,13 +410,25 @@ async def voices_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🗣️ **Select Narrator Voice:**", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    state = get_user_state(user_id)
+    
+    is_thinking = state.get('thinking_mode', False)
+    think_status = "🧠 Thinking: ON" if is_thinking else "🧠 Thinking: OFF"
+
     keyboard = [
+        [InlineKeyboardButton(think_status, callback_data="toggle_thinking")],
         [InlineKeyboardButton("📝 View Prompts", callback_data="st_view")],
         [InlineKeyboardButton("✏️ Edit Burmese", callback_data="st_edit_burmese")],
         [InlineKeyboardButton("✏️ Edit Rephrase", callback_data="st_edit_rephrase")],
         [InlineKeyboardButton("🔄 Reset", callback_data="st_reset")]
     ]
-    await update.message.reply_text("⚙️ **Prompt Settings**", reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    text = "⚙️ **Prompt & AI Settings**"
+    if update.callback_query:
+        await update.callback_query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    else:
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def heygemini_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_modes[update.effective_user.id] = "chat_gemini"
@@ -474,14 +455,16 @@ async def perform_dubbing(update, context):
         await msg.reply_text("❌ **No SRT found.**")
         return
 
-    voice_name = next((k for k, v in VOICE_LIB.items() if v == state['dub_voice']), "Selected Voice")
-    status = await msg.reply_text(f"🎬 **Dubbing ({voice_name})...**")
+    voice_id = state['dub_voice']
+    voice_data = next((v for k, v in VOICE_LIB.items() if v['id'] == voice_id), {"engine": "edge"})
     
-    success, error = await generate_dubbing(user_id, p['srt'], p['dub_audio'], state['dub_voice'])
+    status = await msg.reply_text(f"🎬 **Dubbing ({voice_data['engine'].title()})...**")
+    
+    success, error = await generate_dubbing(user_id, p['srt'], p['dub_audio'], voice_id)
     
     if success:
         await status.delete()
-        await context.bot.send_audio(chat_id=msg.chat_id, audio=open(p['dub_audio'], "rb"), caption=f"✅ **Dubbed by {voice_name}!**")
+        await context.bot.send_audio(chat_id=msg.chat_id, audio=open(p['dub_audio'], "rb"), caption=f"✅ **Dubbed!**")
     else:
         await status.edit_text(f"❌ Dubbing Failed: {error}")
 
@@ -503,7 +486,6 @@ async def perform_translation(update, context, user_id, prompt):
     if success:
         await status.delete()
         await context.bot.send_document(msg.chat_id, document=open(path, "rb"), caption="✅ **Translation Done.**")
-        
         keyboard = [
             [InlineKeyboardButton("✅ Good", callback_data="feedback_yes"), InlineKeyboardButton("❌ Bad", callback_data="feedback_no")]
         ]
@@ -521,15 +503,25 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state['transcribe_engine'] = "gemini" if state['transcribe_engine'] == "whisper" else "whisper"
         await query.answer(f"Engine: {state['transcribe_engine']}")
     
+    elif data == "toggle_thinking":
+        state['thinking_mode'] = not state.get('thinking_mode', False)
+        await settings_command(update, context)
+
     elif data == "cmd_voices":
         await voices_command(query, context)
         await query.answer()
 
     elif data.startswith("set_voice_"):
-        new_voice = data.replace("set_voice_", "")
-        state['dub_voice'] = new_voice
-        v_name = next((k for k, v in VOICE_LIB.items() if v == new_voice), "Custom Voice")
-        await query.message.edit_text(f"✅ Voice set to: **{v_name}**")
+        new_voice_id = data.replace("set_voice_", "")
+        selected_voice_entry = next((v for k, v in VOICE_LIB.items() if v["id"] == new_voice_id), None)
+        
+        if selected_voice_entry:
+            state['dub_voice'] = new_voice_id
+            state['dub_engine'] = selected_voice_entry['engine']
+            v_name = next((k for k, v in VOICE_LIB.items() if v["id"] == new_voice_id), "Unknown")
+            await query.message.edit_text(f"✅ Voice set to: **{v_name}** ({state['dub_engine'].title()})")
+        else:
+            await query.answer("Voice not found")
 
     elif data == "menu_settings":
         await settings_command(update, context)
@@ -587,7 +579,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cancel_command(update, context)
         return
 
-    # --- 1. SRT DETECTION (For Direct Pasting) ---
+    # --- 1. SRT DETECTION ---
     if re.search(r'\d{2}:\d{2}:\d{2},\d{3} -->', text):
         file_mode = 'a'
         if re.match(r'^\s*1\s*$', text.split('\n')[0].strip()) or text.strip().startswith('1\n'):
