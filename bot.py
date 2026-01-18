@@ -12,17 +12,15 @@ import time
 import sys
 
 # --- 🔍 DIAGNOSTICS & LOGGING ---
-# This will make sure you SEE errors in the console
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Check for FFmpeg (Crucial for audio)
+# Check for FFmpeg
 if shutil.which("ffmpeg") is None:
-    logger.error("❌ FFmpeg is NOT installed or not in PATH. Audio processing will fail.")
-    logger.error("👉 Install it: https://ffmpeg.org/download.html")
+    logger.error("❌ FFmpeg is NOT installed. Audio processing will fail.")
 else:
     logger.info("✅ FFmpeg found.")
 
@@ -36,10 +34,9 @@ try:
     from google import genai
     from google.genai import types
     from faster_whisper import WhisperModel
-    logger.info("✅ All libraries imported successfully.")
+    logger.info("✅ All libraries imported.")
 except ImportError as e:
-    logger.critical(f"❌ Missing Library Error: {e}")
-    logger.critical("👉 Run: pip install python-telegram-bot pydub edge-tts google-genai faster-whisper pysrt")
+    logger.critical(f"❌ Missing Library: {e}")
     sys.exit(1)
 
 # --- ⚙️ CONFIGURATION ---
@@ -47,7 +44,7 @@ TG_TOKEN = os.getenv("TG_TOKEN")
 GEMINI_KEY = os.getenv("GEMINI_KEY")
 
 if not TG_TOKEN or not GEMINI_KEY:
-    logger.critical("❌ ERROR: API Keys are missing! Set TG_TOKEN and GEMINI_KEY in environment variables.")
+    logger.critical("❌ ERROR: API Keys missing.")
     sys.exit(1)
 
 # --- 🗣️ VOICE LIBRARY ---
@@ -55,29 +52,37 @@ VOICE_LIB = {
     "🇲🇲 Thiha (Male)": "my-MM-ThihaNeural",
     "🇲🇲 Nular (Female)": "my-MM-NularNeural",
     "🇺🇸 Remy (Multi)": "en-US-RemyMultilingualNeural",
-    "🇺🇸 Andrew (Clean)": "en-US-AndrewNeural",
     "🇺🇸 Brian (Narrator)": "en-US-BrianNeural",
-    "🇺🇸 Ava (Soft)": "en-US-AvaMultilingualNeural",
-    "🇺🇸 Christopher (Deep)": "en-US-ChristopherNeural",
-    "🇺🇸 Ana (Child)": "en-US-AnaNeural",
-    "🇬🇧 Sonia (British)": "en-GB-SoniaNeural",
-    "🇮🇹 Giuseppe (Multi)": "it-IT-GiuseppeMultilingualNeural"
+    "🇬🇧 Sonia (British)": "en-GB-SoniaNeural"
 }
 
-# --- 📝 PROMPTS ---
+# --- 📝 PROMPTS (UPDATED) ---
 SRT_RULES = """
 **FORMATTING INSTRUCTIONS (STRICT):**
 1. The input is an **SRT Subtitle File**.
 2. **OUTPUT FORMAT:** You MUST return a valid SRT file.
 3. **TIMESTAMPS:** Do NOT change, shift, or remove any timestamps. 
 4. **SEQUENCE NUMBERS:** Preserve exact sequence.
-5. **TRANSLATION:** Translate text to natural Burmese.
-6. **TTS OPTIMIZATION:** - Write English loanwords phonetically in Burmese (e.g., CEO -> စီအီးအို).
-   - Adjust spelling for correct TTS pronunciation (e.g., write 'ငမန်း' instead of 'ငါးမန်း').
+5. **NO ENGLISH:** The output text must be 100% Burmese. No English words or characters allowed.
 """
 
+# ✅ UPDATED PROMPT (User's Request + Strict English Ban)
 BURMESE_STYLE = """
-Translate to Burmese naturally, but strictly keep the sentence length concise. The Burmese spoken duration must match the English audio duration. Avoid long-winded formal phrases; use short, spoken-style Burmese.
+Role: Native Burmese professional video narrator and translator.
+Task: Translate the content into natural, fluent Burmese as spoken by a real storyteller.
+
+Guidelines:
+• Use smooth, conversational Burmese, suitable for video narration.
+• Sound natural and engaging, not formal or textbook-like.
+• Do NOT add “ပေါ့” at the end of sentences.
+• Translate by meaning and emotion, not word-by-word.
+• Keep the flow like a continuous story, not separate sentences.
+• Use expressions that native Burmese speakers actually use.
+• Maintain the original tone (calm / suspense / emotional / dramatic as appropriate).
+• **STRICT RULE:** NO ENGLISH CHARACTERS. If there is an English word (e.g. "Okay", "FBI"), translate it or write the sound in Burmese (e.g. "အိုကေ", "အက်ဖ်ဘီအိုင်"). Do not include English text in brackets like (English).
+
+Output:
+Only the final Burmese narration. No explanations, no extra notes.
 """
 
 DEFAULT_PROMPTS = {
@@ -85,7 +90,7 @@ DEFAULT_PROMPTS = {
     "rephrase": "Rephrase this English text to be more clear, natural, and reliable."
 }
 
-# --- 📂 FOLDERS & DATA ---
+# --- 📂 FOLDERS ---
 BASE_FOLDERS = ["downloads", "temp"]
 for f in BASE_FOLDERS:
     os.makedirs(f, exist_ok=True)
@@ -124,9 +129,6 @@ def clean_temp(user_id):
     p = get_paths(user_id)
     if os.path.exists(p['input']): os.remove(p['input'])
     for f in glob.glob(f"temp/{user_id}_chunk_*.mp3"):
-        try: os.remove(f)
-        except: pass
-    for f in glob.glob(f"temp/sample_{user_id}.mp3"):
         try: os.remove(f)
         except: pass
 
@@ -244,6 +246,11 @@ def run_whisper(audio_path, srt_path, txt_path):
         current_start = None
         MAX_CHARS_PER_BLOCK = 80
         all_words = []
+        
+        # ✅ FIX: HONORIFICS LIST
+        # These words should NOT cause a split even if they have a dot
+        HONORIFICS = ["mr.", "mrs.", "ms.", "dr.", "st.", "prof.", "sr.", "jr.", "lt.", "gen.", "col."]
+
         for segment in segments:
             all_words.extend(segment.words)
 
@@ -253,9 +260,18 @@ def run_whisper(audio_path, srt_path, txt_path):
             
             text_str = " ".join([w.word.strip() for w in current_segment_words])
             clean_word = word.word.strip()
+            clean_word_lower = clean_word.lower()
             
-            is_sentence_end = clean_word[-1] in ".?!" if clean_word else False
+            # 1. End of Sentence (.?!) BUT NOT if it is an honorific
+            has_punctuation = clean_word[-1] in ".?!" if clean_word else False
+            is_honorific = clean_word_lower in HONORIFICS
+            
+            is_sentence_end = has_punctuation and not is_honorific
+
+            # 2. Clause break (Comma + Length)
             is_clause_end = (clean_word[-1] == ",") and (len(text_str) > 20)
+            
+            # 3. Too long
             is_too_long = len(text_str) > MAX_CHARS_PER_BLOCK
 
             if is_sentence_end or is_clause_end or is_too_long:
