@@ -49,7 +49,7 @@ if not TG_TOKEN or not GEMINI_KEY:
 # --- 🗣️ VOICE LIBRARY ---
 VOICE_LIB = {
     "🇲🇲 Thiha (Male)": "my-MM-ThihaNeural",
-    "🇲🇲 Nular (Female)": "my-MM-NularNeural",
+    "🇲🇲 Nilar (Female)": "my-MM-NilarNeural",
     "🇺🇸 Remy (Multi)": "en-US-RemyMultilingualNeural",
     "🇺🇸 Brian (Narrator)": "en-US-BrianNeural",
     "🇬🇧 Sonia (British)": "en-GB-SoniaNeural"
@@ -162,82 +162,102 @@ def trim_silence(audio_segment, silence_thresh=-40.0, chunk_size=5):
 def make_audio_crisp(audio_segment):
     clean = audio_segment.high_pass_filter(150)
     return effects.normalize(clean)
-
-# --- 🎬 DUBBING ENGINE (YOUR EXACT CODE) ---
+    
+# --- 🎬 DUBBING ENGINE (VOICERTOOL STYLE: SMART DENSITY) ---
 async def generate_dubbing(user_id, srt_path, output_path, voice):
     """
-    Hybrid Approach:
-    1. Starts with Voicertool-like settings (+10% speed, -2Hz pitch).
-    2. CHECKS duration. If audio is too long, speeds it up GENTLY to fit.
-    3. Maintains sync by adding silence only when necessary (large gaps).
+    Voicertool Logic:
+    1. Analyzes text density (Characters per Second) BEFORE generating.
+    2. Sets the TTS speed perfectly to match the time slot.
+    3. Trims silence aggressively to fit without sounding "rushed".
     """
-    logger.info(f"🎬 Starting Dubbing (Synced + Natural) for {user_id}...")
+    logger.info(f"🎬 Starting Dubbing (Smart Density) for {user_id}...")
     try:
         subs = pysrt.open(srt_path)
         final_audio = AudioSegment.empty()
         current_timeline_ms = 0
         
-        # --- BASE SETTINGS ---
-        # Start with a comfortable speed that matches Voicertool
-        BASE_RATE_VAL = 10 # +10%
-        PITCH_VAL = "-2Hz"
+        # Voicertool often defaults to slightly faster for energy
+        DEFAULT_SPEED = 15 # +15% Base
 
         for i, sub in enumerate(subs):
             start_ms = (sub.start.hours * 3600 + sub.start.minutes * 60 + sub.start.seconds) * 1000 + sub.start.milliseconds
             end_ms = (sub.end.hours * 3600 + sub.end.minutes * 60 + sub.end.seconds) * 1000 + sub.end.milliseconds
-            allowed_duration_ms = end_ms - start_ms
+            duration_allowed = end_ms - start_ms
             
             text = sub.text.replace("\n", " ").strip()
             if not text: continue 
 
-            # --- 1. SYNC CHECK (Wait for start time) ---
-            if start_ms > current_timeline_ms:
-                gap = start_ms - current_timeline_ms
-                if gap > 100:
-                    final_audio += AudioSegment.silent(duration=gap)
-                    current_timeline_ms += gap
-
-            # --- 2. GENERATE (First Pass) ---
-            temp_filename = f"temp/{user_id}_chunk_{i}.mp3"
+            # --- 1. SMART SPEED CALCULATION (The Secret) ---
+            # Estimate how fast we need to speak to fit this slot
+            # Avg Burmese speaking rate is ~12-15 chars per second
+            char_count = len(text)
+            duration_sec = duration_allowed / 1000.0
             
-            communicate = edge_tts.Communicate(text, voice, rate=f"+{BASE_RATE_VAL}%", pitch=PITCH_VAL)
+            if duration_sec == 0: duration_sec = 1 # Prevent divide by zero
+            chars_per_sec = char_count / duration_sec
+            
+            # Logic: If density is high (>18 chars/s), speed up. If low, stay natural.
+            if chars_per_sec > 18:
+                # Need to be fast
+                calculated_rate = int(DEFAULT_SPEED + ((chars_per_sec - 18) * 5))
+            elif chars_per_sec < 10:
+                # Can be relaxed
+                calculated_rate = 10
+            else:
+                # Normal flow
+                calculated_rate = DEFAULT_SPEED
+            
+            # CAP the speed limits (Voicertool rarely goes above +50%)
+            if calculated_rate > 50: calculated_rate = 50
+            if calculated_rate < 0: calculated_rate = 0
+
+            # --- 2. GENERATE WITH CALCULATED RATE ---
+            temp_filename = f"temp/{user_id}_chunk_{i}.mp3"
+            communicate = edge_tts.Communicate(text, voice, rate=f"+{calculated_rate}%", pitch="-2Hz")
             await communicate.save(temp_filename)
             
             segment = AudioSegment.from_file(temp_filename)
+            
+            # --- 3. AGGRESSIVE SILENCE TRIMMING ---
+            # Remove start/end silence to fit better
             segment = trim_silence(segment, silence_thresh=-40.0, chunk_size=5)
 
-            # --- 3. DURATION FIT (The Fix) ---
+            # --- 4. FINAL FIT CHECK ---
+            # If it's STILL too long (rare case), use high-quality compression
+            # instead of re-generating (which causes the chipmunk effect)
             current_len = len(segment)
-            
-            if current_len > allowed_duration_ms:
-                ratio = current_len / allowed_duration_ms
-                extra_speed_needed = (ratio - 1) * 100
-                new_rate = int(BASE_RATE_VAL + extra_speed_needed + 5) 
+            if current_len > duration_allowed + 100: # Allow 100ms buffer
+                # Squeeze using Pydub (Time Stretch) - smoother than TTS rate change
+                speedup_factor = current_len / duration_allowed
+                # Cap squeeze at 1.3x to prevent distortion
+                if speedup_factor > 1.3: speedup_factor = 1.3
                 
-                if new_rate > 50: new_rate = 50
-                
-                communicate = edge_tts.Communicate(text, voice, rate=f"+{new_rate}%", pitch=PITCH_VAL)
-                await communicate.save(temp_filename)
-                
-                segment = AudioSegment.from_file(temp_filename)
-                segment = trim_silence(segment)
+                # Use simple speedup (affects pitch slightly but keeps clarity better than harsh cuts)
+                segment = segment.speedup(playback_speed=speedup_factor, chunk_size=150, crossfade=25)
 
-            # --- 4. CRISP FILTER ---
+            # --- 5. SYNC ON TIMELINE ---
+            if start_ms > current_timeline_ms:
+                gap = start_ms - current_timeline_ms
+                if gap > 0:
+                    final_audio += AudioSegment.silent(duration=gap)
+                    current_timeline_ms += gap
+            
+            # Crisp Filter
             segment = make_audio_crisp(segment)
             
-            # --- 5. APPEND ---
             final_audio += segment
             current_timeline_ms += len(segment)
             
             if os.path.exists(temp_filename): os.remove(temp_filename)
 
         final_audio.export(output_path, format="mp3")
-        logger.info("✅ Dubbing complete.")
         return True, None
 
     except Exception as e:
         logger.error(f"❌ Dubbing Error: {e}")
         return False, str(e)
+
 
 # --- 🧠 AI ENGINES ---
 def format_timestamp(seconds):
