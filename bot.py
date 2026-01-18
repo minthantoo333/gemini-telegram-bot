@@ -9,29 +9,46 @@ import math
 import shutil
 import re 
 import time
+import sys
+
+# --- 🔍 DIAGNOSTICS & LOGGING ---
+# This will make sure you SEE errors in the console
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Check for FFmpeg (Crucial for audio)
+if shutil.which("ffmpeg") is None:
+    logger.error("❌ FFmpeg is NOT installed or not in PATH. Audio processing will fail.")
+    logger.error("👉 Install it: https://ffmpeg.org/download.html")
+else:
+    logger.info("✅ FFmpeg found.")
 
 # --- 📦 LIBRARIES ---
-# Audio Processing
-from pydub import AudioSegment, effects
-from pydub.silence import detect_leading_silence
-import edge_tts
-
-# Telegram
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
-from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, CallbackQueryHandler, filters
-
-# AI Tools
-from google import genai
-from google.genai import types
-from faster_whisper import WhisperModel
+try:
+    from pydub import AudioSegment, effects
+    from pydub.silence import detect_leading_silence
+    import edge_tts
+    from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+    from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, CallbackQueryHandler, filters
+    from google import genai
+    from google.genai import types
+    from faster_whisper import WhisperModel
+    logger.info("✅ All libraries imported successfully.")
+except ImportError as e:
+    logger.critical(f"❌ Missing Library Error: {e}")
+    logger.critical("👉 Run: pip install python-telegram-bot pydub edge-tts google-genai faster-whisper pysrt")
+    sys.exit(1)
 
 # --- ⚙️ CONFIGURATION ---
 TG_TOKEN = os.getenv("TG_TOKEN")
 GEMINI_KEY = os.getenv("GEMINI_KEY")
 
 if not TG_TOKEN or not GEMINI_KEY:
-    print("❌ ERROR: API Keys are missing! Set TG_TOKEN and GEMINI_KEY in environment variables.")
-    exit()
+    logger.critical("❌ ERROR: API Keys are missing! Set TG_TOKEN and GEMINI_KEY in environment variables.")
+    sys.exit(1)
 
 # --- 🗣️ VOICE LIBRARY ---
 VOICE_LIB = {
@@ -59,7 +76,6 @@ SRT_RULES = """
    - Adjust spelling for correct TTS pronunciation (e.g., write 'ငမန်း' instead of 'ငါးမန်း').
 """
 
-# ✅ PROMPT: Concise for better sync
 BURMESE_STYLE = """
 Translate to Burmese naturally, but strictly keep the sentence length concise. The Burmese spoken duration must match the English audio duration. Avoid long-winded formal phrases; use short, spoken-style Burmese.
 """
@@ -132,9 +148,9 @@ async def send_copyable_message(chat_id, bot, text):
         try:
             await bot.send_message(chat_id=chat_id, text=f"```\n{chunk}\n```", parse_mode='Markdown')
         except Exception as e:
-            print(f"Message Send Error: {e}")
+            logger.error(f"Message Send Error: {e}")
 
-# --- 🔊 AUDIO HELPERS (FROM YOUR REQUEST) ---
+# --- 🔊 AUDIO HELPERS ---
 def trim_silence(audio_segment, silence_thresh=-40.0, chunk_size=5):
     if len(audio_segment) < 100: return audio_segment
     start_trim = detect_leading_silence(audio_segment, silence_threshold=silence_thresh, chunk_size=chunk_size)
@@ -146,24 +162,15 @@ def make_audio_crisp(audio_segment):
     clean = audio_segment.high_pass_filter(150)
     return effects.normalize(clean)
 
-# --- 🎬 DUBBING ENGINE (HYBRID: NATURAL + SYNCED) ---
-# ✅ USING THE EXACT CODE YOU PROVIDED
+# --- 🎬 DUBBING ENGINE ---
 async def generate_dubbing(user_id, srt_path, output_path, voice):
-    """
-    Hybrid Approach:
-    1. Starts with Voicertool-like settings (+10% speed, -2Hz pitch).
-    2. CHECKS duration. If audio is too long, speeds it up GENTLY to fit.
-    3. Maintains sync by adding silence only when necessary (large gaps).
-    """
-    print(f"🎬 Starting Dubbing (Synced + Natural) for {user_id}...")
+    logger.info(f"🎬 Starting Dubbing for User {user_id}...")
     try:
         subs = pysrt.open(srt_path)
         final_audio = AudioSegment.empty()
         current_timeline_ms = 0
         
-        # --- BASE SETTINGS ---
-        # Start with a comfortable speed that matches Voicertool
-        BASE_RATE_VAL = 10 # +10%
+        BASE_RATE_VAL = 10 
         PITCH_VAL = "-2Hz"
 
         for i, sub in enumerate(subs):
@@ -174,63 +181,45 @@ async def generate_dubbing(user_id, srt_path, output_path, voice):
             text = sub.text.replace("\n", " ").strip()
             if not text: continue 
 
-            # --- 1. SYNC CHECK (Wait for start time) ---
-            # If the previous audio finished EARLY, we must wait for this subtitle's start time.
-            # Otherwise, the audio will drift and happen too soon.
             if start_ms > current_timeline_ms:
                 gap = start_ms - current_timeline_ms
-                # Only fill gap if it's significant (>100ms) to avoid micro-stutters
                 if gap > 100:
                     final_audio += AudioSegment.silent(duration=gap)
                     current_timeline_ms += gap
 
-            # --- 2. GENERATE (First Pass) ---
             temp_filename = f"temp/{user_id}_chunk_{i}.mp3"
             
-            # Start with natural +10% speed
             communicate = edge_tts.Communicate(text, voice, rate=f"+{BASE_RATE_VAL}%", pitch=PITCH_VAL)
             await communicate.save(temp_filename)
             
             segment = AudioSegment.from_file(temp_filename)
             segment = trim_silence(segment, silence_thresh=-40.0, chunk_size=5)
 
-            # --- 3. DURATION FIT (The Fix) ---
-            # Check if natural voice is too long for the timestamp
             current_len = len(segment)
-            
             if current_len > allowed_duration_ms:
-                # Calculate how much faster we need to be
                 ratio = current_len / allowed_duration_ms
-                
-                # Calculate new percentage needed (e.g., if ratio is 1.2, we need +20% MORE)
-                # We add this to our base rate of 10
                 extra_speed_needed = (ratio - 1) * 100
-                new_rate = int(BASE_RATE_VAL + extra_speed_needed + 5) # +5 buffer
-                
-                # CAP the speed so it doesn't sound crazy (Max +50%)
+                new_rate = int(BASE_RATE_VAL + extra_speed_needed + 5) 
                 if new_rate > 50: new_rate = 50
                 
-                # Re-generate with faster speed
                 communicate = edge_tts.Communicate(text, voice, rate=f"+{new_rate}%", pitch=PITCH_VAL)
                 await communicate.save(temp_filename)
                 
-                # Load and Trim again
                 segment = AudioSegment.from_file(temp_filename)
                 segment = trim_silence(segment)
 
-            # --- 4. CRISP FILTER ---
             segment = make_audio_crisp(segment)
-            
-            # --- 5. APPEND ---
             final_audio += segment
             current_timeline_ms += len(segment)
             
             if os.path.exists(temp_filename): os.remove(temp_filename)
 
         final_audio.export(output_path, format="mp3")
+        logger.info("✅ Dubbing complete.")
         return True, None
 
     except Exception as e:
+        logger.error(f"❌ Dubbing Error: {e}")
         return False, str(e)
 
 # --- 🧠 AI ENGINES ---
@@ -243,7 +232,7 @@ def format_timestamp(seconds):
     return f"{hours:02}:{minutes:02}:{math.floor(seconds):02},{milliseconds:03}"
 
 def run_whisper(audio_path, srt_path, txt_path):
-    print(f"🎙️ [Whisper] Processing...")
+    logger.info(f"🎙️ [Whisper] Starting transcription...")
     try:
         device = "cuda" if torch.cuda.is_available() else "cpu"
         compute_type = "float16" if device == "cuda" else "int8"
@@ -285,8 +274,10 @@ def run_whisper(audio_path, srt_path, txt_path):
             for i, sub in enumerate(final_subs, start=1):
                 srt.write(f"{i}\n{sub['start']} --> {sub['end']}\n{sub['text']}\n\n")
                 txt.write(f"{sub['text']} ")
+        logger.info("✅ Whisper Done.")
         return "Whisper (Smart)"
     except Exception as e:
+        logger.error(f"Whisper Error: {e}")
         return f"Error: {e}"
 
 def run_gemini_transcribe(audio_path, srt_path, txt_path):
@@ -338,19 +329,18 @@ async def run_chat_gemini(user_id, text):
     if user_id not in chat_histories: chat_histories[user_id] = []
     client = genai.Client(api_key=GEMINI_KEY)
     
-    # Init chat with existing history
-    chat = client.chats.create(model='gemini-2.0-flash', history=chat_histories[user_id])
-    
     try:
+        chat = client.chats.create(model='gemini-2.0-flash', history=chat_histories[user_id])
         response = chat.send_message(text)
-        # Update history
         chat_histories[user_id] = chat.history 
         return response.text
     except Exception as e:
+        logger.error(f"Gemini Chat Error: {e}")
         return f"Gemini Error: {e}"
 
 # --- 🤖 BOT COMMANDS & HANDLERS ---
 async def post_init(application):
+    logger.info("🤖 Bot is initializing commands...")
     await application.bot.set_my_commands([
         BotCommand("start", "🏠 Dashboard"),
         BotCommand("voices", "🗣️ Change Voice"),
@@ -361,24 +351,29 @@ async def post_init(application):
     ])
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    state = get_user_state(user_id)
-    v_name = next((k for k, v in VOICE_LIB.items() if v == state['dub_voice']), "Unknown")
-    
-    text = (
-        f"👋 **Welcome to Video AI Studio!**\n\n"
-        f"⚙️ **Current Settings:**\n"
-        f"├ 🎙️ **Engine:** `{state['transcribe_engine'].title()}`\n"
-        f"└ 🗣️ **Voice:** `{v_name}`\n\n"
-        f"👇 **What would you like to do?**"
-    )
-    
-    keyboard = [
-        [InlineKeyboardButton("🗣️ Select Voice", callback_data="cmd_voices"), InlineKeyboardButton("🎙️ Switch Engine", callback_data="toggle_transcribe")],
-        [InlineKeyboardButton("📝 Edit Prompts", callback_data="menu_settings"), InlineKeyboardButton("🤖 Chat AI", callback_data="cmd_chat")],
-        [InlineKeyboardButton("🧹 Clear Data", callback_data="cmd_clear")]
-    ]
-    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    logger.info(f"📩 Received /start from {update.effective_user.id}")
+    try:
+        user_id = update.effective_user.id
+        state = get_user_state(user_id)
+        v_name = next((k for k, v in VOICE_LIB.items() if v == state['dub_voice']), "Unknown")
+        
+        text = (
+            f"👋 **Welcome to Video AI Studio!**\n\n"
+            f"⚙️ **Current Settings:**\n"
+            f"├ 🎙️ **Engine:** `{state['transcribe_engine'].title()}`\n"
+            f"└ 🗣️ **Voice:** `{v_name}`\n\n"
+            f"👇 **What would you like to do?**"
+        )
+        
+        keyboard = [
+            [InlineKeyboardButton("🗣️ Select Voice", callback_data="cmd_voices"), InlineKeyboardButton("🎙️ Switch Engine", callback_data="toggle_transcribe")],
+            [InlineKeyboardButton("📝 Edit Prompts", callback_data="menu_settings"), InlineKeyboardButton("🤖 Chat AI", callback_data="cmd_chat")],
+            [InlineKeyboardButton("🧹 Clear Data", callback_data="cmd_clear")]
+        ]
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"CRASH in start command: {e}")
+        await update.message.reply_text("❌ Error starting bot. Check console logs.")
 
 async def enable_chat_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -451,64 +446,70 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     state = get_user_state(user_id)
     data = query.data
+    logger.info(f"🔘 Button Clicked: {data}")
     
-    if data == "cmd_start":
-        await start(update, context)
+    try:
+        if data == "cmd_start":
+            await start(update, context)
 
-    elif data == "toggle_transcribe":
-        state['transcribe_engine'] = "gemini" if state['transcribe_engine'] == "whisper" else "whisper"
-        await query.answer(f"Switched to: {state['transcribe_engine'].title()}")
-        await start(update, context)
-    
-    elif data == "cmd_voices":
-        await voices_command(update, context)
-
-    elif data == "cmd_chat":
-        user_modes[user_id] = "chat_gemini"
-        await query.message.reply_text("🤖 **Gemini Chat Mode ON**\nType `/cancel` to exit.")
-        await query.answer()
-
-    elif data == "cmd_clear":
-        wipe_user_data(user_id)
-        await query.answer("All data cleared.")
-        await query.message.reply_text("🧹 **Workspace Cleared.**")
-
-    elif data.startswith("set_voice_"):
-        new_voice = data.replace("set_voice_", "")
-        state['dub_voice'] = new_voice
-        v_name = next((k for k, v in VOICE_LIB.items() if v == new_voice), "Custom")
+        elif data == "toggle_transcribe":
+            state['transcribe_engine'] = "gemini" if state['transcribe_engine'] == "whisper" else "whisper"
+            await query.answer(f"Switched to: {state['transcribe_engine'].title()}")
+            await start(update, context)
         
-        await query.message.edit_text(f"✅ Voice set to: **{v_name}**\n⏳ Generating sample...")
-        
-        if "my-MM" in new_voice: sample_text = "မင်္ဂလာပါ၊ ဒါက ကျွန်တော့်ရဲ့ အသံနမူနာပါ။"
-        elif "it-IT" in new_voice: sample_text = "Ciao, questo è un campione della mia voce."
-        else: sample_text = "Hello, this is a quick sample of my voice."
-        
-        sample_path = f"temp/sample_{user_id}.mp3"
-        try:
-            communicate = edge_tts.Communicate(sample_text, new_voice)
-            await communicate.save(sample_path)
-            await context.bot.send_voice(chat_id=query.message.chat_id, voice=open(sample_path, "rb"), caption=f"🎙️ **{v_name}**")
-        except:
-            await context.bot.send_message(chat_id=query.message.chat_id, text="❌ Could not generate sample.")
+        elif data == "cmd_voices":
+            await voices_command(update, context)
 
-    elif data == "menu_settings":
-        await settings_command(update, context)
+        elif data == "cmd_chat":
+            user_modes[user_id] = "chat_gemini"
+            await query.message.reply_text("🤖 **Gemini Chat Mode ON**\nType `/cancel` to exit.")
+            await query.answer()
 
-    elif data == "st_view":
-        await send_copyable_message(query.message.chat_id, context.bot, f"🇲🇲 **Burmese:**\n{get_active_prompt(user_id, 'burmese')}")
-        await send_copyable_message(query.message.chat_id, context.bot, f"🇺🇸 **Rephrase:**\n{get_active_prompt(user_id, 'rephrase')}")
+        elif data == "cmd_clear":
+            wipe_user_data(user_id)
+            await query.answer("All data cleared.")
+            await query.message.reply_text("🧹 **Workspace Cleared.**")
 
-    elif data.startswith("st_edit_"):
-        mode = data.replace("st_edit_", "")
-        user_modes[user_id] = f"edit_prompt_{mode}"
-        await query.message.edit_text(f"✍️ Send new **{mode.title()}** prompt:")
+        elif data.startswith("set_voice_"):
+            new_voice = data.replace("set_voice_", "")
+            state['dub_voice'] = new_voice
+            v_name = next((k for k, v in VOICE_LIB.items() if v == new_voice), "Custom")
+            
+            await query.message.edit_text(f"✅ Voice set to: **{v_name}**\n⏳ Generating sample...")
+            
+            if "my-MM" in new_voice: sample_text = "မင်္ဂလာပါ၊ ဒါက ကျွန်တော့်ရဲ့ အသံနမူနာပါ။"
+            elif "it-IT" in new_voice: sample_text = "Ciao, questo è un campione della mia voce."
+            else: sample_text = "Hello, this is a quick sample of my voice."
+            
+            sample_path = f"temp/sample_{user_id}.mp3"
+            try:
+                communicate = edge_tts.Communicate(sample_text, new_voice)
+                await communicate.save(sample_path)
+                await context.bot.send_voice(chat_id=query.message.chat_id, voice=open(sample_path, "rb"), caption=f"🎙️ **{v_name}**")
+            except Exception as e:
+                logger.error(f"TTS Error: {e}")
+                await context.bot.send_message(chat_id=query.message.chat_id, text="❌ Could not generate sample.")
 
-    elif data == "trans_burmese":
-        await perform_translation(update, context, user_id, get_active_prompt(user_id, "burmese"))
+        elif data == "menu_settings":
+            await settings_command(update, context)
 
-    elif data == "trigger_dub":
-        await perform_dubbing(update, context)
+        elif data == "st_view":
+            await send_copyable_message(query.message.chat_id, context.bot, f"🇲🇲 **Burmese:**\n{get_active_prompt(user_id, 'burmese')}")
+            await send_copyable_message(query.message.chat_id, context.bot, f"🇺🇸 **Rephrase:**\n{get_active_prompt(user_id, 'rephrase')}")
+
+        elif data.startswith("st_edit_"):
+            mode = data.replace("st_edit_", "")
+            user_modes[user_id] = f"edit_prompt_{mode}"
+            await query.message.edit_text(f"✍️ Send new **{mode.title()}** prompt:")
+
+        elif data == "trans_burmese":
+            await perform_translation(update, context, user_id, get_active_prompt(user_id, "burmese"))
+
+        elif data == "trigger_dub":
+            await perform_dubbing(update, context)
+            
+    except Exception as e:
+        logger.error(f"Callback Error: {e}")
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -517,6 +518,8 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode = user_modes.get(user_id)
     state = get_user_state(user_id)
     p = get_paths(user_id)
+    
+    logger.info(f"📩 Text received: {text[:20]}...")
 
     if text.startswith("/cancel"):
         user_modes[user_id] = None
@@ -555,6 +558,8 @@ async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     user_id = msg.from_user.id
     p = get_paths(user_id)
+    logger.info("📩 File received.")
+    
     file_obj = await (msg.document or msg.video or msg.audio).get_file()
     name = msg.document.file_name if msg.document else "vid.mp4"
     
@@ -599,25 +604,35 @@ async def process_media(update, context, is_url):
             
         await status.edit_text("✅ **Done!** Type `/translate` to translate or `/dub` to dub.")
 
-if __name__ == '__main__':
-    print("🚀 Video AI Bot Running...")
-    app = ApplicationBuilder().token(TG_TOKEN).post_init(post_init).build()
-    
-    # Commands
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("voices", voices_command))
-    app.add_handler(CommandHandler("settings", settings_command))
-    app.add_handler(CommandHandler("translate", lambda u, c: u.message.reply_text("🌍 Options:", reply_markup=InlineKeyboardMarkup([
-        [InlineKeyboardButton("To Burmese", callback_data="trans_burmese")]
-    ]))))
-    app.add_handler(CommandHandler("dub", perform_dubbing))
-    app.add_handler(CommandHandler("heygemini", enable_chat_mode))
-    app.add_handler(CommandHandler("clearall", lambda u, c: wipe_user_data(u.effective_user.id)))
-    app.add_handler(CommandHandler("cancel", lambda u, c: u.message.reply_text("✅ Cancelled.")))
+    except Exception as e:
+        logger.error(f"Processing Error: {e}")
+        await status.edit_text(f"❌ Processing Error: {e}")
 
-    # Handlers
-    app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_handler))
-    app.add_handler(MessageHandler(filters.VIDEO | filters.Document.ALL | filters.AUDIO, file_handler))
+if __name__ == '__main__':
+    logger.info("🚀 Video AI Bot STARTING...")
     
-    app.run_polling()
+    try:
+        app = ApplicationBuilder().token(TG_TOKEN).post_init(post_init).build()
+        
+        # Commands
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(CommandHandler("voices", voices_command))
+        app.add_handler(CommandHandler("settings", settings_command))
+        app.add_handler(CommandHandler("translate", lambda u, c: u.message.reply_text("🌍 Options:", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("To Burmese", callback_data="trans_burmese")]
+        ]))))
+        app.add_handler(CommandHandler("dub", perform_dubbing))
+        app.add_handler(CommandHandler("heygemini", enable_chat_mode))
+        app.add_handler(CommandHandler("clearall", lambda u, c: wipe_user_data(u.effective_user.id)))
+        app.add_handler(CommandHandler("cancel", lambda u, c: u.message.reply_text("✅ Cancelled.")))
+
+        # Handlers
+        app.add_handler(CallbackQueryHandler(callback_handler))
+        app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_handler))
+        app.add_handler(MessageHandler(filters.VIDEO | filters.Document.ALL | filters.AUDIO, file_handler))
+        
+        logger.info("✅ Bot is polling now. Send /start in Telegram.")
+        app.run_polling()
+        
+    except Exception as e:
+        logger.critical(f"🔥 FATAL ERROR: {e}")
