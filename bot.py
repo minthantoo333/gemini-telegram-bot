@@ -31,10 +31,7 @@ GEMINI_KEY = os.getenv("GEMINI_KEY")
 
 if not TG_TOKEN or not GEMINI_KEY:
     print("❌ ERROR: API Keys are missing! Set TG_TOKEN and GEMINI_KEY in environment variables.")
-    # For testing, you can uncomment and hardcode below (NOT RECOMMENDED for production):
-    # TG_TOKEN = "YOUR_TG_TOKEN"
-    # GEMINI_KEY = "YOUR_GEMINI_KEY"
-    if not TG_TOKEN or not GEMINI_KEY: exit()
+    exit()
 
 # --- 🗣️ VOICE LIBRARY ---
 VOICE_LIB = {
@@ -50,7 +47,7 @@ VOICE_LIB = {
     "🇮🇹 Giuseppe (Multi)": "it-IT-GiuseppeMultilingualNeural"
 }
 
-# --- 📝 PROMPTS (UPDATED FOR SYNC) ---
+# --- 📝 PROMPTS ---
 SRT_RULES = """
 **FORMATTING INSTRUCTIONS (STRICT):**
 1. The input is an **SRT Subtitle File**.
@@ -60,17 +57,11 @@ SRT_RULES = """
 5. **TRANSLATION:** Translate text to natural Burmese.
 6. **TTS OPTIMIZATION:** - Write English loanwords phonetically in Burmese (e.g., CEO -> စီအီးအို).
    - Adjust spelling for correct TTS pronunciation (e.g., write 'ငမန်း' instead of 'ငါးမန်း').
-7. **TIMING CONSTRAINT (CRITICAL):** - Burmese text is often longer than English. You MUST translate concisely.
-   - Use spoken-style, short sentences.
-   - Do NOT use formal/flowery language that expands the length.
-   - The spoken duration of the Burmese text MUST fit within the original English timestamp.
 """
 
+# ✅ UPDATED PROMPT HERE
 BURMESE_STYLE = """
-Role: Professional Video Narrator (Burmese).
-Style: Natural, engaging, clear narration.
-No 'ပေါ့' (pout) at end of sentences.
-Translate naturally as a continuous story, not robotic word-by-word.
+Translate to Burmese naturally, but strictly keep the sentence length concise. The Burmese spoken duration must match the English audio duration. Avoid long-winded formal phrases; use short, spoken-style Burmese.
 """
 
 DEFAULT_PROMPTS = {
@@ -143,7 +134,7 @@ async def send_copyable_message(chat_id, bot, text):
         except Exception as e:
             print(f"Message Send Error: {e}")
 
-# --- 🔊 AUDIO PROCESSING (PRO + FAILSAFE) ---
+# --- 🔊 AUDIO PROCESSING ---
 def trim_silence(audio_segment, silence_thresh=-40.0, chunk_size=5):
     if len(audio_segment) < 100: return audio_segment
     start_trim = detect_leading_silence(audio_segment, silence_threshold=silence_thresh, chunk_size=chunk_size)
@@ -152,108 +143,57 @@ def trim_silence(audio_segment, silence_thresh=-40.0, chunk_size=5):
     return audio_segment[start_trim:duration-end_trim]
 
 def make_audio_crisp(audio_segment):
-    """High Quality Filter (Better than basic high_pass)"""
     clean_audio = audio_segment.high_pass_filter(200)
     high_freqs = clean_audio.high_pass_filter(2000)
     crisp_audio = clean_audio.overlay(high_freqs - 4) 
     return effects.normalize(crisp_audio)
 
-def force_speed_change(audio, target_duration):
-    """
-    Strictly compresses audio to fit target_duration using pydub.
-    Used as a failsafe when TTS rate adjustment isn't enough.
-    """
-    current_duration = len(audio)
-    if current_duration <= target_duration:
-        return audio
-
-    # Calculate exact ratio needed + 1% buffer
-    ratio = current_duration / target_duration
-    
-    try:
-        # chunk_size=50 and crossfade=25 are good defaults for speech
-        compressed = effects.speedup(audio, playback_speed=ratio, chunk_size=50, crossfade=25)
-        
-        # Hard trim if it's still slightly over due to rounding
-        if len(compressed) > target_duration:
-            compressed = compressed[:target_duration]
-            
-        return compressed
-    except Exception as e:
-        print(f"⚠️ Speedup failed: {e}, performing hard cut.")
-        return audio[:target_duration]
-
-# --- 🎬 DUBBING ENGINE (STRICT SYNC) ---
+# --- 🎬 DUBBING ENGINE ---
 async def generate_dubbing(user_id, srt_path, output_path, voice):
-    print(f"🎬 Starting Strict Dubbing for {user_id}...")
+    print(f"🎬 Starting Dubbing for {user_id}...")
     try:
         subs = pysrt.open(srt_path)
         final_audio = AudioSegment.empty()
-        
-        # Track the EXACT timeline position we are currently at
         current_timeline_ms = 0
         
-        # Base settings
         BASE_RATE_VAL = 10 
         PITCH_VAL = "-2Hz"
 
         for i, sub in enumerate(subs):
-            # Calculate strict start/end in ms
             start_ms = (sub.start.hours * 3600 + sub.start.minutes * 60 + sub.start.seconds) * 1000 + sub.start.milliseconds
             end_ms = (sub.end.hours * 3600 + sub.end.minutes * 60 + sub.end.seconds) * 1000 + sub.end.milliseconds
-            
-            # The exact window this audio MUST fit into
             allowed_duration_ms = end_ms - start_ms
             
             text = sub.text.replace("\n", " ").strip()
             if not text: continue 
 
-            # --- 1. SYNC & GAP FILLING ---
-            # If the subtitle starts LATER than our current audio, add silence to fill the gap.
             if start_ms > current_timeline_ms:
                 gap = start_ms - current_timeline_ms
-                final_audio += AudioSegment.silent(duration=gap)
-                current_timeline_ms += gap
-            
-            # --- 2. GENERATE (First Pass) ---
+                if gap > 100:
+                    final_audio += AudioSegment.silent(duration=gap)
+                    current_timeline_ms += gap
+
             temp_filename = f"temp/{user_id}_chunk_{i}.mp3"
             
-            # Initial generation
             communicate = edge_tts.Communicate(text, voice, rate=f"+{BASE_RATE_VAL}%", pitch=PITCH_VAL)
             await communicate.save(temp_filename)
             
             segment = AudioSegment.from_file(temp_filename)
             segment = trim_silence(segment)
 
-            # --- 3. DURATION CHECK & FIX ---
             current_len = len(segment)
-            
             if current_len > allowed_duration_ms:
-                # Step A: Try re-generating with faster TTS (Better quality)
                 ratio = current_len / allowed_duration_ms
-                extra_speed = (ratio - 1) * 100
-                new_rate = int(BASE_RATE_VAL + extra_speed + 10) # +10 buffer
-                if new_rate > 90: new_rate = 90 # Max cap
+                extra_speed_needed = (ratio - 1) * 100
+                new_rate = int(BASE_RATE_VAL + extra_speed_needed + 5)
+                if new_rate > 50: new_rate = 50
                 
                 communicate = edge_tts.Communicate(text, voice, rate=f"+{new_rate}%", pitch=PITCH_VAL)
                 await communicate.save(temp_filename)
-                
                 segment = AudioSegment.from_file(temp_filename)
                 segment = trim_silence(segment)
 
-                # Step B: STRICT FAILSAFE (Pydub Speedup)
-                # If it is STILL too long after re-generation, force compress it.
-                if len(segment) > allowed_duration_ms:
-                    segment = force_speed_change(segment, allowed_duration_ms)
-
-            # --- 4. APPLY & UPDATE TIMELINE ---
-            # Double check we don't exceed the slot
-            if len(segment) > allowed_duration_ms:
-                segment = segment[:allowed_duration_ms] # Hard trim as last resort
-
-            # Pro Filter 
             segment = make_audio_crisp(segment)
-
             final_audio += segment
             current_timeline_ms += len(segment)
             
@@ -263,8 +203,6 @@ async def generate_dubbing(user_id, srt_path, output_path, voice):
         return True, None
 
     except Exception as e:
-        import traceback
-        traceback.print_exc()
         return False, str(e)
 
 # --- 🧠 AI ENGINES ---
@@ -277,7 +215,7 @@ def format_timestamp(seconds):
     return f"{hours:02}:{minutes:02}:{math.floor(seconds):02},{milliseconds:03}"
 
 def run_whisper(audio_path, srt_path, txt_path):
-    print(f"🎙️ [Whisper] Processing with Smart Clauses...")
+    print(f"🎙️ [Whisper] Processing...")
     try:
         device = "cuda" if torch.cuda.is_available() else "cpu"
         compute_type = "float16" if device == "cuda" else "int8"
@@ -287,7 +225,6 @@ def run_whisper(audio_path, srt_path, txt_path):
         final_subs = []
         current_segment_words = []
         current_start = None
-        
         MAX_CHARS_PER_BLOCK = 80
         all_words = []
         for segment in segments:
@@ -307,20 +244,14 @@ def run_whisper(audio_path, srt_path, txt_path):
             if is_sentence_end or is_clause_end or is_too_long:
                 start_ts = format_timestamp(current_start)
                 end_ts = format_timestamp(word.end)
-                final_subs.append({
-                    "start": start_ts,
-                    "end": end_ts,
-                    "text": text_str
-                })
+                final_subs.append({"start": start_ts, "end": end_ts, "text": text_str})
                 current_segment_words = []
                 current_start = None
 
         if current_segment_words:
             start_ts = format_timestamp(current_start)
             end_ts = format_timestamp(all_words[-1].end)
-            final_subs.append({
-                "start": start_ts, "end": end_ts, "text": " ".join([w.word.strip() for w in current_segment_words])
-            })
+            final_subs.append({"start": start_ts, "end": end_ts, "text": " ".join([w.word.strip() for w in current_segment_words])})
 
         with open(srt_path, "w", encoding="utf-8") as srt, open(txt_path, "w", encoding="utf-8") as txt:
             for i, sub in enumerate(final_subs, start=1):
@@ -331,7 +262,6 @@ def run_whisper(audio_path, srt_path, txt_path):
         return f"Error: {e}"
 
 def run_gemini_transcribe(audio_path, srt_path, txt_path):
-    print(f"✨ [Gemini] Listening...")
     try:
         client = genai.Client(api_key=GEMINI_KEY)
         with open(audio_path, "rb") as f: audio_bytes = f.read()
@@ -373,31 +303,20 @@ async def run_translate(user_id, prompt_text):
 
 async def run_chat_gemini(user_id, text):
     current_time = time.time()
-    # Reset memory if inactive for 24 hours
     if user_id in user_last_active and (current_time - user_last_active[user_id] > 86400):
         chat_histories[user_id] = []
     user_last_active[user_id] = current_time
 
-    if user_id not in chat_histories: 
-        chat_histories[user_id] = []
-
+    if user_id not in chat_histories: chat_histories[user_id] = []
     client = genai.Client(api_key=GEMINI_KEY)
     
-    # Initialize chat with stored history
+    # ✅ FIX: Initialize chat with existing history
     chat = client.chats.create(model='gemini-2.0-flash', history=chat_histories[user_id])
     
     try:
         response = chat.send_message(text)
-        
-        # --- FIX: MANUALLY SAVE HISTORY ---
-        # The SDK object updates locally, but we must update our global dictionary
-        chat_histories[user_id].append(
-            types.Content(role="user", parts=[types.Part.from_text(text=text)])
-        )
-        chat_histories[user_id].append(
-            types.Content(role="model", parts=[types.Part.from_text(text=response.text)])
-        )
-        
+        # ✅ FIX: Save the updated history back to memory so context is remembered
+        chat_histories[user_id] = chat.history 
         return response.text
     except Exception as e:
         return f"Gemini Error: {e}"
@@ -432,6 +351,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🧹 Clear Data", callback_data="cmd_clear")]
     ]
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+# ✅ FIX: Dedicated function for the /heygemini slash command
+async def enable_chat_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user_modes[user_id] = "chat_gemini"
+    await update.message.reply_text("🤖 **Gemini Chat Mode ON**\nType `/cancel` to exit.")
 
 async def voices_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = []
@@ -471,7 +396,7 @@ async def perform_dubbing(update, context):
         return
 
     voice_name = next((k for k, v in VOICE_LIB.items() if v == state['dub_voice']), "Voice")
-    status = await msg.reply_text(f"🎬 **Dubbing with {voice_name}...**\n(Strict Sync Mode ON)")
+    status = await msg.reply_text(f"🎬 **Dubbing with {voice_name}...**")
     
     success, error = await generate_dubbing(user_id, p['srt'], p['dub_audio'], state['dub_voice'])
     
@@ -526,7 +451,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state['dub_voice'] = new_voice
         v_name = next((k for k, v in VOICE_LIB.items() if v == new_voice), "Custom")
         
-        # --- 🔊 GENERATE VOICE SAMPLE ---
         await query.message.edit_text(f"✅ Voice set to: **{v_name}**\n⏳ Generating sample...")
         
         if "my-MM" in new_voice: sample_text = "မင်္ဂလာပါ၊ ဒါက ကျွန်တော့်ရဲ့ အသံနမူနာပါ။"
@@ -663,7 +587,8 @@ if __name__ == '__main__':
         [InlineKeyboardButton("To Burmese", callback_data="trans_burmese")]
     ]))))
     app.add_handler(CommandHandler("dub", perform_dubbing))
-    app.add_handler(CommandHandler("heygemini", lambda u, c: callback_handler(u, c)))
+    # ✅ FIX: Updated command handler to use dedicated function
+    app.add_handler(CommandHandler("heygemini", enable_chat_mode))
     app.add_handler(CommandHandler("clearall", lambda u, c: wipe_user_data(u.effective_user.id)))
     app.add_handler(CommandHandler("cancel", lambda u, c: u.message.reply_text("✅ Cancelled.")))
 
