@@ -59,7 +59,7 @@ SRT_RULES = """
    - Adjust spelling for correct TTS pronunciation (e.g., write 'ငမန်း' instead of 'ငါးမန်း').
 """
 
-# ✅ UPDATED PROMPT HERE
+# ✅ PROMPT: Concise for better sync
 BURMESE_STYLE = """
 Translate to Burmese naturally, but strictly keep the sentence length concise. The Burmese spoken duration must match the English audio duration. Avoid long-winded formal phrases; use short, spoken-style Burmese.
 """
@@ -134,7 +134,7 @@ async def send_copyable_message(chat_id, bot, text):
         except Exception as e:
             print(f"Message Send Error: {e}")
 
-# --- 🔊 AUDIO PROCESSING ---
+# --- 🔊 AUDIO HELPERS (FROM YOUR REQUEST) ---
 def trim_silence(audio_segment, silence_thresh=-40.0, chunk_size=5):
     if len(audio_segment) < 100: return audio_segment
     start_trim = detect_leading_silence(audio_segment, silence_threshold=silence_thresh, chunk_size=chunk_size)
@@ -143,20 +143,27 @@ def trim_silence(audio_segment, silence_thresh=-40.0, chunk_size=5):
     return audio_segment[start_trim:duration-end_trim]
 
 def make_audio_crisp(audio_segment):
-    clean_audio = audio_segment.high_pass_filter(200)
-    high_freqs = clean_audio.high_pass_filter(2000)
-    crisp_audio = clean_audio.overlay(high_freqs - 4) 
-    return effects.normalize(crisp_audio)
+    clean = audio_segment.high_pass_filter(150)
+    return effects.normalize(clean)
 
-# --- 🎬 DUBBING ENGINE ---
+# --- 🎬 DUBBING ENGINE (HYBRID: NATURAL + SYNCED) ---
+# ✅ USING THE EXACT CODE YOU PROVIDED
 async def generate_dubbing(user_id, srt_path, output_path, voice):
-    print(f"🎬 Starting Dubbing for {user_id}...")
+    """
+    Hybrid Approach:
+    1. Starts with Voicertool-like settings (+10% speed, -2Hz pitch).
+    2. CHECKS duration. If audio is too long, speeds it up GENTLY to fit.
+    3. Maintains sync by adding silence only when necessary (large gaps).
+    """
+    print(f"🎬 Starting Dubbing (Synced + Natural) for {user_id}...")
     try:
         subs = pysrt.open(srt_path)
         final_audio = AudioSegment.empty()
         current_timeline_ms = 0
         
-        BASE_RATE_VAL = 10 
+        # --- BASE SETTINGS ---
+        # Start with a comfortable speed that matches Voicertool
+        BASE_RATE_VAL = 10 # +10%
         PITCH_VAL = "-2Hz"
 
         for i, sub in enumerate(subs):
@@ -167,33 +174,54 @@ async def generate_dubbing(user_id, srt_path, output_path, voice):
             text = sub.text.replace("\n", " ").strip()
             if not text: continue 
 
+            # --- 1. SYNC CHECK (Wait for start time) ---
+            # If the previous audio finished EARLY, we must wait for this subtitle's start time.
+            # Otherwise, the audio will drift and happen too soon.
             if start_ms > current_timeline_ms:
                 gap = start_ms - current_timeline_ms
+                # Only fill gap if it's significant (>100ms) to avoid micro-stutters
                 if gap > 100:
                     final_audio += AudioSegment.silent(duration=gap)
                     current_timeline_ms += gap
 
+            # --- 2. GENERATE (First Pass) ---
             temp_filename = f"temp/{user_id}_chunk_{i}.mp3"
             
+            # Start with natural +10% speed
             communicate = edge_tts.Communicate(text, voice, rate=f"+{BASE_RATE_VAL}%", pitch=PITCH_VAL)
             await communicate.save(temp_filename)
             
             segment = AudioSegment.from_file(temp_filename)
-            segment = trim_silence(segment)
+            segment = trim_silence(segment, silence_thresh=-40.0, chunk_size=5)
 
+            # --- 3. DURATION FIT (The Fix) ---
+            # Check if natural voice is too long for the timestamp
             current_len = len(segment)
+            
             if current_len > allowed_duration_ms:
+                # Calculate how much faster we need to be
                 ratio = current_len / allowed_duration_ms
+                
+                # Calculate new percentage needed (e.g., if ratio is 1.2, we need +20% MORE)
+                # We add this to our base rate of 10
                 extra_speed_needed = (ratio - 1) * 100
-                new_rate = int(BASE_RATE_VAL + extra_speed_needed + 5)
+                new_rate = int(BASE_RATE_VAL + extra_speed_needed + 5) # +5 buffer
+                
+                # CAP the speed so it doesn't sound crazy (Max +50%)
                 if new_rate > 50: new_rate = 50
                 
+                # Re-generate with faster speed
                 communicate = edge_tts.Communicate(text, voice, rate=f"+{new_rate}%", pitch=PITCH_VAL)
                 await communicate.save(temp_filename)
+                
+                # Load and Trim again
                 segment = AudioSegment.from_file(temp_filename)
                 segment = trim_silence(segment)
 
+            # --- 4. CRISP FILTER ---
             segment = make_audio_crisp(segment)
+            
+            # --- 5. APPEND ---
             final_audio += segment
             current_timeline_ms += len(segment)
             
@@ -310,12 +338,12 @@ async def run_chat_gemini(user_id, text):
     if user_id not in chat_histories: chat_histories[user_id] = []
     client = genai.Client(api_key=GEMINI_KEY)
     
-    # ✅ FIX: Initialize chat with existing history
+    # Init chat with existing history
     chat = client.chats.create(model='gemini-2.0-flash', history=chat_histories[user_id])
     
     try:
         response = chat.send_message(text)
-        # ✅ FIX: Save the updated history back to memory so context is remembered
+        # Update history
         chat_histories[user_id] = chat.history 
         return response.text
     except Exception as e:
@@ -352,7 +380,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
-# ✅ FIX: Dedicated function for the /heygemini slash command
 async def enable_chat_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_modes[user_id] = "chat_gemini"
@@ -572,9 +599,6 @@ async def process_media(update, context, is_url):
             
         await status.edit_text("✅ **Done!** Type `/translate` to translate or `/dub` to dub.")
 
-    except Exception as e:
-        await status.edit_text(f"❌ Processing Error: {e}")
-
 if __name__ == '__main__':
     print("🚀 Video AI Bot Running...")
     app = ApplicationBuilder().token(TG_TOKEN).post_init(post_init).build()
@@ -587,7 +611,6 @@ if __name__ == '__main__':
         [InlineKeyboardButton("To Burmese", callback_data="trans_burmese")]
     ]))))
     app.add_handler(CommandHandler("dub", perform_dubbing))
-    # ✅ FIX: Updated command handler to use dedicated function
     app.add_handler(CommandHandler("heygemini", enable_chat_mode))
     app.add_handler(CommandHandler("clearall", lambda u, c: wipe_user_data(u.effective_user.id)))
     app.add_handler(CommandHandler("cancel", lambda u, c: u.message.reply_text("✅ Cancelled.")))
