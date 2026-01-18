@@ -234,7 +234,7 @@ def format_timestamp(seconds):
     return f"{hours:02}:{minutes:02}:{math.floor(seconds):02},{milliseconds:03}"
 
 def run_whisper(audio_path, srt_path, txt_path):
-    logger.info(f"🎙️ [Whisper] Starting transcription...")
+    logger.info(f"🎙️ [Whisper] Starting Dubbing-Focused Transcription...")
     try:
         device = "cuda" if torch.cuda.is_available() else "cpu"
         compute_type = "float16" if device == "cuda" else "int8"
@@ -244,43 +244,71 @@ def run_whisper(audio_path, srt_path, txt_path):
         final_subs = []
         current_segment_words = []
         current_start = None
-        MAX_CHARS_PER_BLOCK = 80
-        all_words = []
         
-        # ✅ FIX: HONORIFICS LIST
-        # These words should NOT cause a split even if they have a dot
+        # --- ⚙️ DUBBING SETTINGS ---
+        # We allow VERY long lines because we want flow, not reading speed.
+        # Only force a cut if it's huge (e.g. 300 chars) to prevent memory issues.
+        HARD_LIMIT = 300  
+        PAUSE_THRESHOLD = 0.8 # If silence > 0.8s, we treat it as a new block
+        
         HONORIFICS = ["mr.", "mrs.", "ms.", "dr.", "st.", "prof.", "sr.", "jr.", "lt.", "gen.", "col."]
-
+        
+        all_words = []
         for segment in segments:
             all_words.extend(segment.words)
 
+        previous_end_time = 0
+
         for i, word in enumerate(all_words):
             if current_start is None: current_start = word.start
+            
+            # Check for Silence Gap (Natural Pause)
+            time_since_last_word = word.start - previous_end_time
+            is_long_pause = (time_since_last_word > PAUSE_THRESHOLD) and (len(current_segment_words) > 0)
+            
+            # If there was a big silence, force output PREVIOUS cluster first
+            if is_long_pause:
+                 text_str = " ".join([w.word.strip() for w in current_segment_words])
+                 start_ts = format_timestamp(current_start)
+                 end_ts = format_timestamp(previous_end_time) # End at last word
+                 final_subs.append({"start": start_ts, "end": end_ts, "text": text_str})
+                 
+                 # Reset for NEW block starting with CURRENT word
+                 current_segment_words = [word]
+                 current_start = word.start
+                 previous_end_time = word.end
+                 continue
+
+            # Add word to current block
             current_segment_words.append(word)
+            previous_end_time = word.end
             
             text_str = " ".join([w.word.strip() for w in current_segment_words])
+            current_len = len(text_str)
+            
             clean_word = word.word.strip()
             clean_word_lower = clean_word.lower()
             
-            # 1. End of Sentence (.?!) BUT NOT if it is an honorific
+            # --- LOGIC: SPLIT ONLY ON REAL SENTENCES ---
+            
+            # 1. End of Sentence (.?!)
             has_punctuation = clean_word[-1] in ".?!" if clean_word else False
             is_honorific = clean_word_lower in HONORIFICS
-            
             is_sentence_end = has_punctuation and not is_honorific
-
-            # 2. Clause break (Comma + Length)
-            is_clause_end = (clean_word[-1] == ",") and (len(text_str) > 20)
             
-            # 3. Too long
-            is_too_long = len(text_str) > MAX_CHARS_PER_BLOCK
+            # 2. Safety Net (Just in case it runs for 1 minute straight)
+            is_too_long = current_len > HARD_LIMIT
 
-            if is_sentence_end or is_clause_end or is_too_long:
+            if is_sentence_end or is_too_long:
                 start_ts = format_timestamp(current_start)
                 end_ts = format_timestamp(word.end)
                 final_subs.append({"start": start_ts, "end": end_ts, "text": text_str})
+                
+                # Reset
                 current_segment_words = []
                 current_start = None
 
+        # Flush remaining
         if current_segment_words:
             start_ts = format_timestamp(current_start)
             end_ts = format_timestamp(all_words[-1].end)
@@ -290,11 +318,13 @@ def run_whisper(audio_path, srt_path, txt_path):
             for i, sub in enumerate(final_subs, start=1):
                 srt.write(f"{i}\n{sub['start']} --> {sub['end']}\n{sub['text']}\n\n")
                 txt.write(f"{sub['text']} ")
-        logger.info("✅ Whisper Done.")
-        return "Whisper (Smart)"
+        
+        logger.info("✅ Whisper Done (Dubbing Optimized).")
+        return "Whisper (Dubbing)"
     except Exception as e:
         logger.error(f"Whisper Error: {e}")
         return f"Error: {e}"
+
 
 def run_gemini_transcribe(audio_path, srt_path, txt_path):
     try:
