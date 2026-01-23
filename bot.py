@@ -92,7 +92,7 @@ SRT_RULES = """
 1. The input is an **SRT Subtitle File**.
 2. **OUTPUT FORMAT:** You MUST return a valid SRT file.
 3. **TIMESTAMPS:** Do NOT change, shift, or remove any timestamps. 
-4. **SEQUENCE NUMBERS:** Preserve exact sequence.
+4. **REFERENCE:** Translate line-by-line matching the original exactly.
 5. **NO ENGLISH:** The output text must be 100% Burmese. No English words or characters allowed.
 """
 
@@ -135,13 +135,11 @@ def get_user_state(user_id):
         user_prefs[user_id] = {
             "transcribe_engine": "whisper_dub",
             "dub_voice": "my-MM-ThihaNeural",
-            "output_format": "srt", # Default to SRT
+            "output_format": "srt", 
             "custom_prompts": {} 
         }
-    # Ensure backward compatibility if key is missing
     if "output_format" not in user_prefs[user_id]:
         user_prefs[user_id]["output_format"] = "srt"
-        
     return user_prefs[user_id]
 
 def get_active_prompt(user_id, key):
@@ -156,13 +154,19 @@ def get_paths(user_id):
         "srt": f"downloads/{user_id}_subs.srt",
         "txt": f"downloads/{user_id}_transcript.txt",
         "trans_result": f"downloads/{user_id}_translated",
-        "dub_audio": f"downloads/{user_id}_dubbed.mp3"
+        "dub_audio": f"downloads/{user_id}_dubbed.mp3",
+        # Pattern for yt-dlp downloaded subs
+        "dl_sub_prefix": f"downloads/{user_id}_video"
     }
 
 def clean_temp(user_id):
     p = get_paths(user_id)
     if os.path.exists(p['input']): os.remove(p['input'])
     for f in glob.glob(f"temp/{user_id}_chunk_*.mp3"):
+        try: os.remove(f)
+        except: pass
+    # Clean downloaded subs
+    for f in glob.glob(f"{p['dl_sub_prefix']}*"):
         try: os.remove(f)
         except: pass
 
@@ -581,7 +585,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.edit_text(f"✅ Voice set: **{new_voice}**")
         elif data == "menu_settings": await settings_command(update, context)
         
-        # ✅ TOGGLE OUTPUT FORMAT
         elif data == "toggle_format":
             new_fmt = "txt" if state.get("output_format") == "srt" else "srt"
             state["output_format"] = new_fmt
@@ -715,31 +718,68 @@ async def process_media(update, context, is_url, url=None):
     try:
         clean_temp(user_id)
         if is_url and url:
-            cmd = f"yt-dlp -x --audio-format mp3 --user-agent 'Mozilla/5.0' -o '{p['audio']}' {url}"
-            subprocess.run(cmd, shell=True)
+            # 1. DOWNLOAD AUDIO
+            cmd_audio = f"yt-dlp -x --audio-format mp3 --user-agent 'Mozilla/5.0' -o '{p['audio']}' {url}"
+            subprocess.run(cmd_audio, shell=True)
+
+            # 2. TRY DOWNLOAD OFFICIAL SUBS (Correct Original)
+            # This attempts to download English or Auto-subs and converts to SRT
+            cmd_sub = f"yt-dlp --skip-download --write-sub --write-auto-sub --sub-lang en.* --convert-subs srt -o '{p['dl_sub_prefix']}' {url}"
+            subprocess.run(cmd_sub, shell=True)
+            
+            # Check if subs appeared
+            found_sub = None
+            for f in glob.glob(f"{p['dl_sub_prefix']}*.srt"):
+                found_sub = f
+                break
+            
+            if found_sub and os.path.exists(found_sub):
+                shutil.move(found_sub, p['srt'])
+                caption = "✅ **Found Original Subtitles (English)**"
+            else:
+                # Fallback to Whisper
+                loop = asyncio.get_event_loop()
+                if state['transcribe_engine'] == "whisper_sub":
+                    await loop.run_in_executor(None, run_whisper_sub, p['audio'], p['srt'], p['txt'])
+                    caption = "✅ **Transcribed (Whisper Sub Mode)**"
+                elif state['transcribe_engine'] == "whisper_dub":
+                    await loop.run_in_executor(None, run_whisper_dub, p['audio'], p['srt'], p['txt'])
+                    caption = "✅ **Transcribed (Whisper Dub Mode)**"
+                else:
+                    await loop.run_in_executor(None, run_gemini_transcribe, p['audio'], p['srt'], p['txt'])
+                    caption = "✅ **Transcribed (Gemini)**"
+
         else:
+            # File Upload (No original subs available online)
             file_obj = await (msg.video or msg.document or msg.audio).get_file()
             await file_obj.download_to_drive(p['input'])
             subprocess.run(f"ffmpeg -y -i {p['input']} -vn -acodec libmp3lame -q:a 2 {p['audio']}", shell=True)
             
-        loop = asyncio.get_event_loop()
-        
-        if state['transcribe_engine'] == "whisper_sub":
-            await loop.run_in_executor(None, run_whisper_sub, p['audio'], p['srt'], p['txt'])
-        elif state['transcribe_engine'] == "whisper_dub":
-            await loop.run_in_executor(None, run_whisper_dub, p['audio'], p['srt'], p['txt'])
-        else:
-            await loop.run_in_executor(None, run_gemini_transcribe, p['audio'], p['srt'], p['txt'])
+            loop = asyncio.get_event_loop()
+            if state['transcribe_engine'] == "whisper_sub":
+                await loop.run_in_executor(None, run_whisper_sub, p['audio'], p['srt'], p['txt'])
+                caption = "✅ **Transcribed (Whisper Sub)**"
+            elif state['transcribe_engine'] == "whisper_dub":
+                await loop.run_in_executor(None, run_whisper_dub, p['audio'], p['srt'], p['txt'])
+                caption = "✅ **Transcribed (Whisper Dub)**"
+            else:
+                await loop.run_in_executor(None, run_gemini_transcribe, p['audio'], p['srt'], p['txt'])
+                caption = "✅ **Transcribed (Gemini)**"
 
         await status.delete()
         
-        # ✅ AUTOMATED OUTPUT based on SETTINGS
+        # AUTOMATED OUTPUT
         pref_fmt = state.get("output_format", "srt")
-        
         if pref_fmt == "srt" and os.path.exists(p['srt']):
-            await context.bot.send_document(msg.chat_id, open(p['srt'], "rb"), caption="📜 **SRT Generated**")
-        elif pref_fmt == "txt" and os.path.exists(p['txt']):
-             await context.bot.send_document(msg.chat_id, open(p['txt'], "rb"), caption="📄 **TXT Generated**")
+            await context.bot.send_document(msg.chat_id, open(p['srt'], "rb"), caption=caption)
+        elif pref_fmt == "txt":
+             # Ensure txt exists if we only have SRT from download
+             if not os.path.exists(p['txt']) and os.path.exists(p['srt']):
+                 subs = pysrt.open(p['srt'])
+                 with open(p['txt'], 'w') as f: 
+                     for s in subs: f.write(s.text + " ")
+             if os.path.exists(p['txt']):
+                 await context.bot.send_document(msg.chat_id, open(p['txt'], "rb"), caption=caption)
 
         keyboard = [
             [InlineKeyboardButton("🌍 Translate", callback_data="trans_burmese"), InlineKeyboardButton("🎬 Dub Now", callback_data="trigger_dub")]
