@@ -52,7 +52,7 @@ VOICE_LIB = {
     "🇲🇲 Thiha (Male)": "my-MM-ThihaNeural",
     "🇲🇲 Nilar (Female)": "my-MM-NilarNeural",
 
-    # 🇮🇹 ITALIAN (New Request)
+    # 🇮🇹 ITALIAN
     "🇮🇹 Giuseppe (Italian)": "it-IT-GiuseppeNeural",
 
     # 🇺🇸 US ENGLISH
@@ -509,7 +509,7 @@ async def perform_dubbing(update, context):
         await status.delete()
         await context.bot.send_audio(chat_id=msg.chat_id, audio=open(p['dub_audio'], "rb"), title=f"Dubbed_{voice_name}", caption=f"✅ **Dubbed by {voice_name}!**")
         
-        # 4. REMOVE USER'S SENT TEXT MESSAGE
+        # REMOVE USER'S SENT TEXT MESSAGE
         msgs_to_del = context.user_data.get('msg_ids_to_del', [])
         if msgs_to_del:
             for m_id in msgs_to_del:
@@ -517,7 +517,7 @@ async def perform_dubbing(update, context):
                     await context.bot.delete_message(chat_id=msg.chat_id, message_id=m_id)
                 except Exception as e:
                     logger.warning(f"Could not delete message {m_id}: {e}")
-            context.user_data['msg_ids_to_del'] = [] # Reset
+            context.user_data['msg_ids_to_del'] = [] 
 
     else:
         await status.edit_text(f"❌ Failed: {error}")
@@ -578,8 +578,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await perform_translation(update, context, user_id, get_active_prompt(user_id, "burmese"))
         elif data == "trigger_dub":
             await perform_dubbing(update, context)
-        
-        # 1. NEW MENU ACTIONS
         elif data == "get_srt":
             if os.path.exists(p['srt']):
                 await context.bot.send_document(query.message.chat_id, open(p['srt'], "rb"), caption="📄 **Your SRT File**")
@@ -605,31 +603,24 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("✅ Mode exited.")
         return
 
-    # --- 3. SMART SRT DETECTION & STITCHING ---
-    # Detect if text looks like SRT (starts with number, has timestamps)
+    # SRT Smart Stitching
     is_srt_chunk = re.match(r'^\d+\s*$', text.strip().split('\n')[0]) or re.search(r'\d{2}:\d{2}:\d{2},\d{3} -->', text)
     
     if is_srt_chunk:
-        # Store message ID for later deletion
         if 'msg_ids_to_del' not in context.user_data: context.user_data['msg_ids_to_del'] = []
         context.user_data['msg_ids_to_del'].append(msg.message_id)
 
-        # Append to existing SRT file
         mode = "a" if os.path.exists(p['srt']) else "w"
-        # Add a newline if appending to ensure separation
         prefix = "\n\n" if mode == "a" else ""
         with open(p['srt'], mode, encoding="utf-8") as f: f.write(prefix + text)
         
-        # Check Audio Duration Validation
         audio_dur = get_audio_duration_sec(p['audio'])
         srt_last_sec = get_last_timestamp_sec(p['srt'])
         
-        # Logic: If audio exists and SRT is significantly shorter ( > 10s difference), assume more is coming
         if audio_dur > 0 and (audio_dur - srt_last_sec > 10):
             await msg.reply_text(f"📥 **Received Part.** (Audio: {int(audio_dur)}s | Text: {int(srt_last_sec)}s)\nWaiting for next part...")
-            return # Wait for next message
+            return 
         
-        # If complete or no audio to compare, show menu
         keyboard = [[InlineKeyboardButton("🎬 Dub Audio", callback_data="trigger_dub")]]
         await msg.reply_text("✅ **SRT Text Saved.**", reply_markup=InlineKeyboardMarkup(keyboard))
         return
@@ -647,8 +638,10 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"✅ **{key.title()} Prompt Updated.**")
         return
 
-    if "http" in text:
-        await process_media(update, context, is_url=True)
+    # ✅ UPDATED URL DETECTION FOR TIKTOK
+    url_pattern = re.search(r'(https?://(?:www\.|vm\.|vt\.)?(?:youtube\.com|youtu\.be|tiktok\.com)/[^\s]+)', text)
+    if url_pattern:
+        await process_media(update, context, is_url=True, url=url_pattern.group(0))
         return
 
     if len(text) > 5:
@@ -660,8 +653,24 @@ async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = msg.from_user.id
     p = get_paths(user_id)
     
-    file_obj = await (msg.document or msg.video or msg.audio).get_file()
-    name = msg.document.file_name if msg.document else "vid.mp4"
+    # ✅ 1. CHECK FILE OBJECT
+    doc = msg.document or msg.video or msg.audio
+    if not doc:
+        await msg.reply_text("❌ Unknown file type.")
+        return
+
+    # ✅ 2. SIZE LIMIT CHECK (20MB)
+    FILE_SIZE_LIMIT = 20 * 1024 * 1024  # 20MB in bytes
+    if doc.file_size > FILE_SIZE_LIMIT:
+        await msg.reply_text(
+            "⚠️ **File Too Big!**\n\n"
+            "Telegram bots can only download files under **20MB** directly.\n"
+            "👉 **Solution:** Upload to TikTok or YouTube and send the **Link** here instead!"
+        )
+        return
+
+    file_obj = await doc.get_file()
+    name = doc.file_name if hasattr(doc, 'file_name') else "vid.mp4"
     
     if name.lower().endswith('.srt'):
         await file_obj.download_to_drive(p['srt'])
@@ -676,7 +685,7 @@ async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     await process_media(update, context, is_url=False)
 
-async def process_media(update, context, is_url):
+async def process_media(update, context, is_url, url=None):
     msg = update.message
     user_id = msg.from_user.id
     p = get_paths(user_id)
@@ -685,8 +694,11 @@ async def process_media(update, context, is_url):
     status = await msg.reply_text("⏳ **Processing Media...**")
     try:
         clean_temp(user_id)
-        if is_url:
-            subprocess.run(f"yt-dlp -x --audio-format mp3 -o '{p['audio']}' {msg.text}", shell=True)
+        if is_url and url:
+            # ✅ UPDATED YT-DLP COMMAND FOR TIKTOK
+            # We add user-agent to avoid TikTok blocking the bot request
+            cmd = f"yt-dlp -x --audio-format mp3 --user-agent 'Mozilla/5.0' -o '{p['audio']}' {url}"
+            subprocess.run(cmd, shell=True)
         else:
             file_obj = await (msg.video or msg.document or msg.audio).get_file()
             await file_obj.download_to_drive(p['input'])
@@ -703,7 +715,6 @@ async def process_media(update, context, is_url):
 
         await status.delete()
         
-        # 1. ASK USER WHAT THEY WANT
         keyboard = [
             [InlineKeyboardButton("📄 Download .txt", callback_data="get_txt"), InlineKeyboardButton("📜 Download .srt", callback_data="get_srt")],
             [InlineKeyboardButton("🌍 Translate", callback_data="trans_burmese"), InlineKeyboardButton("🎬 Dub Now", callback_data="trigger_dub")]
