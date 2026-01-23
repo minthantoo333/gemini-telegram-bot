@@ -134,9 +134,14 @@ def get_user_state(user_id):
     if user_id not in user_prefs:
         user_prefs[user_id] = {
             "transcribe_engine": "whisper_dub",
-            "dub_voice": "my-MM-ThihaNeural", 
+            "dub_voice": "my-MM-ThihaNeural",
+            "output_format": "srt", # Default to SRT
             "custom_prompts": {} 
         }
+    # Ensure backward compatibility if key is missing
+    if "output_format" not in user_prefs[user_id]:
+        user_prefs[user_id]["output_format"] = "srt"
+        
     return user_prefs[user_id]
 
 def get_active_prompt(user_id, key):
@@ -459,11 +464,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     v_name = next((k for k, v in VOICE_LIB.items() if v == state['dub_voice']), "Unknown")
     engine_name = "Whisper (Dub)" if state['transcribe_engine'] == 'whisper_dub' else "Whisper (Sub)"
     
-    text = f"👋 **Video AI Studio**\n⚙️ Engine: `{engine_name}`\n🗣️ Voice: `{v_name}`"
+    text = f"👋 **Video AI Studio**\n⚙️ Engine: `{engine_name}`\n🗣️ Voice: `{v_name}`\n📄 Output: `{state['output_format'].upper()}`"
     keyboard = [
         [InlineKeyboardButton("🎙️ Set: Sub Mode", callback_data="set_eng_sub"), InlineKeyboardButton("🎙️ Set: Dub Mode", callback_data="set_eng_dub")],
         [InlineKeyboardButton("🗣️ Select Voice", callback_data="cmd_voices"), InlineKeyboardButton("🤖 Chat AI", callback_data="cmd_chat")],
-        [InlineKeyboardButton("📝 Edit Prompts", callback_data="menu_settings"), InlineKeyboardButton("🧹 Clear Data", callback_data="cmd_clear")]
+        [InlineKeyboardButton("📝 Settings", callback_data="menu_settings"), InlineKeyboardButton("🧹 Clear Data", callback_data="cmd_clear")]
     ]
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
@@ -483,12 +488,20 @@ async def voices_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🗣️ **Voice Library**", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    state = get_user_state(user_id)
+    current_fmt = state.get('output_format', 'srt').upper()
+    
     keyboard = [
+        [InlineKeyboardButton(f"📄 Format: {current_fmt} (Click to Switch)", callback_data="toggle_format")],
         [InlineKeyboardButton("📝 View Prompts", callback_data="st_view")],
         [InlineKeyboardButton("✏️ Edit Burmese", callback_data="st_edit_burmese"), InlineKeyboardButton("✏️ Edit Rephrase", callback_data="st_edit_rephrase")],
         [InlineKeyboardButton("🔙 Back", callback_data="cmd_start")]
     ]
-    await update.message.reply_text("⚙️ **Prompt Settings**", reply_markup=InlineKeyboardMarkup(keyboard))
+    if update.callback_query:
+        await update.callback_query.message.edit_text("⚙️ **Settings**", reply_markup=InlineKeyboardMarkup(keyboard))
+    else:
+        await update.message.reply_text("⚙️ **Settings**", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def perform_dubbing(update, context):
     user_id = update.effective_user.id
@@ -567,6 +580,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             state['dub_voice'] = new_voice
             await query.message.edit_text(f"✅ Voice set: **{new_voice}**")
         elif data == "menu_settings": await settings_command(update, context)
+        
+        # ✅ TOGGLE OUTPUT FORMAT
+        elif data == "toggle_format":
+            new_fmt = "txt" if state.get("output_format") == "srt" else "srt"
+            state["output_format"] = new_fmt
+            await settings_command(update, context) # Refresh menu
+            await query.answer(f"Format set to {new_fmt.upper()}")
+
         elif data == "st_view":
             await send_copyable_message(query.message.chat_id, context.bot, f"🇲🇲 **Burmese:**\n{get_active_prompt(user_id, 'burmese')}")
             await send_copyable_message(query.message.chat_id, context.bot, f"🇺🇸 **Rephrase:**\n{get_active_prompt(user_id, 'rephrase')}")
@@ -638,7 +659,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"✅ **{key.title()} Prompt Updated.**")
         return
 
-    # ✅ UPDATED URL DETECTION FOR TIKTOK
+    # UPDATED URL DETECTION FOR TIKTOK
     url_pattern = re.search(r'(https?://(?:www\.|vm\.|vt\.)?(?:youtube\.com|youtu\.be|tiktok\.com)/[^\s]+)', text)
     if url_pattern:
         await process_media(update, context, is_url=True, url=url_pattern.group(0))
@@ -653,14 +674,13 @@ async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = msg.from_user.id
     p = get_paths(user_id)
     
-    # ✅ 1. CHECK FILE OBJECT
     doc = msg.document or msg.video or msg.audio
     if not doc:
         await msg.reply_text("❌ Unknown file type.")
         return
 
-    # ✅ 2. SIZE LIMIT CHECK (20MB)
-    FILE_SIZE_LIMIT = 20 * 1024 * 1024  # 20MB in bytes
+    # SIZE LIMIT CHECK (20MB)
+    FILE_SIZE_LIMIT = 20 * 1024 * 1024  
     if doc.file_size > FILE_SIZE_LIMIT:
         await msg.reply_text(
             "⚠️ **File Too Big!**\n\n"
@@ -695,8 +715,6 @@ async def process_media(update, context, is_url, url=None):
     try:
         clean_temp(user_id)
         if is_url and url:
-            # ✅ UPDATED YT-DLP COMMAND FOR TIKTOK
-            # We add user-agent to avoid TikTok blocking the bot request
             cmd = f"yt-dlp -x --audio-format mp3 --user-agent 'Mozilla/5.0' -o '{p['audio']}' {url}"
             subprocess.run(cmd, shell=True)
         else:
@@ -715,11 +733,18 @@ async def process_media(update, context, is_url, url=None):
 
         await status.delete()
         
+        # ✅ AUTOMATED OUTPUT based on SETTINGS
+        pref_fmt = state.get("output_format", "srt")
+        
+        if pref_fmt == "srt" and os.path.exists(p['srt']):
+            await context.bot.send_document(msg.chat_id, open(p['srt'], "rb"), caption="📜 **SRT Generated**")
+        elif pref_fmt == "txt" and os.path.exists(p['txt']):
+             await context.bot.send_document(msg.chat_id, open(p['txt'], "rb"), caption="📄 **TXT Generated**")
+
         keyboard = [
-            [InlineKeyboardButton("📄 Download .txt", callback_data="get_txt"), InlineKeyboardButton("📜 Download .srt", callback_data="get_srt")],
             [InlineKeyboardButton("🌍 Translate", callback_data="trans_burmese"), InlineKeyboardButton("🎬 Dub Now", callback_data="trigger_dub")]
         ]
-        await msg.reply_text("✅ **Processing Complete!** What do you want to do?", reply_markup=InlineKeyboardMarkup(keyboard))
+        await msg.reply_text(f"✅ **Done!** (Format: {pref_fmt.upper()})\nChoose next step:", reply_markup=InlineKeyboardMarkup(keyboard))
 
     except Exception as e:
         logger.error(f"Processing Error: {e}")
